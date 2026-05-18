@@ -1,0 +1,20 @@
+# Environment — contains API keys
+.env
+*.env
+
+# Dataset examples — may contain real customer data
+datasets/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Generated failures
+FAILED-*.txt
+
+# macOS
+.DS_Store
+
+# uv
+uv.lock

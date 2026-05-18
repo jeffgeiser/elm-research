@@ -1,0 +1,605 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zenlayer.internal/account-intelligence/v0.1/schema.json",
+  "title": "Account Intelligence Brief",
+  "description": "Unified output schema for the fine-tuned account intelligence model. One model, one schema, six surfaces (meeting_prep, qbr, handoff, renewal_alert, onboarding, escalation). The model emits only the sections relevant to the requested surface; the rest are declared via `empty_sections` so absence is explicit. This is the training contract — every example in the dataset conforms to this shape.",
+  "version": "0.1.0",
+  "type": "object",
+  "required": [
+    "account",
+    "surface",
+    "generated_at",
+    "executive_summary",
+    "confidence",
+    "empty_sections",
+    "sources_used"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "_meta": {
+      "type": "object",
+      "description": "Optional example-level annotation — NOT model output. The training pipeline strips this before scoring; it lives alongside the brief to capture construction notes, synthetic vs real provenance, redaction status, etc. Shape is intentionally free-form: this is annotation, not contract."
+    },
+
+    "account": {
+      "type": "object",
+      "description": "Account identity. Stable across surfaces — same fields whether the brief is a QBR or an escalation.",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Canonical account name as it appears in Salesforce."
+        },
+        "type": {
+          "type": ["string", "null"],
+          "description": "SF Account.Type. Free-text on the SF side — common observed values: 'End User' (most customer rows), 'Customer', 'Prospect', 'Partner', 'Other'. Null is legitimate when SF hasn't categorized the row. Drives downstream surface behavior — e.g. Prospect tilts toward research vs internal data."
+        },
+        "industry": {
+          "type": ["string", "null"]
+        },
+        "cid": {
+          "type": ["string", "null"],
+          "description": "Zenlayer Customer ID. NULL for non-customer rows."
+        },
+        "sf_account_id": {
+          "type": ["string", "null"],
+          "description": "Salesforce Account.Id (18-char). Anchor for source attribution."
+        }
+      }
+    },
+
+    "surface": {
+      "type": "string",
+      "enum": [
+        "meeting_prep",
+        "qbr",
+        "handoff",
+        "renewal_alert",
+        "onboarding",
+        "escalation"
+      ],
+      "description": "Which use case this brief is for. The model is conditioned on this — same input data, different surface = different sections emphasized."
+    },
+
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp when the brief was synthesized."
+    },
+
+    "executive_summary": {
+      "type": "string",
+      "description": "1–3 sentences capturing the most important state of this account for this surface. The single 'if you read nothing else' line. Always present; never empty."
+    },
+
+    "confidence": {
+      "type": "object",
+      "description": "Model's own assessment of how grounded the brief is in the source data. Lets consumers route low-confidence briefs to human review.",
+      "required": ["overall"],
+      "additionalProperties": false,
+      "properties": {
+        "overall": {
+          "type": "string",
+          "enum": ["high", "medium", "low"]
+        },
+        "rationale": {
+          "type": "string",
+          "description": "1 sentence explaining the overall score. Low typically means missing key sources (no SF data, stale activity)."
+        },
+        "per_section": {
+          "type": "object",
+          "description": "Section-key → high|medium|low. Optional — only include when section-level confidence varies meaningfully.",
+          "additionalProperties": {
+            "type": "string",
+            "enum": ["high", "medium", "low"]
+          }
+        }
+      }
+    },
+
+    "empty_sections": {
+      "type": "array",
+      "description": "Section keys the model deliberately checked and found no signal for. Declaring absence is the anti-hallucination guard — if a section isn't here AND isn't populated, the model failed to consider it.",
+      "items": {
+        "type": "string",
+        "enum": [
+          "must_address",
+          "pipeline",
+          "support_health",
+          "relationship_map",
+          "recent_activity",
+          "external_signal",
+          "knowledge_context",
+          "pricing_history",
+          "renewal",
+          "timeline",
+          "asks_and_next_steps",
+          "landmines",
+          "talking_points",
+          "carryover",
+          "meeting_opener"
+        ]
+      },
+      "uniqueItems": true
+    },
+
+    "sources_used": {
+      "type": "array",
+      "description": "Distinct upstream source types that contributed to this brief. Lets consumers show 'sourced from SF + Teams + Knowledge' chips. Source types not present here MUST NOT appear in any inline citation.",
+      "items": {
+        "type": "string",
+        "enum": [
+          "sf_account",
+          "sf_opp",
+          "sf_contact",
+          "sf_activity",
+          "sf_case",
+          "teams",
+          "sharepoint",
+          "knowledge",
+          "news",
+          "pricing_history",
+          "prior_prep",
+          "calendar",
+          "email",
+          "internal_note"
+        ]
+      },
+      "uniqueItems": true
+    },
+
+    "must_address": {
+      "type": "array",
+      "description": "The 'what to drive in this surface' layer. Each entry is one topic, mentioned once. 3–5 max; rank by urgency descending. Empty = nothing material, which is honest. Used by: meeting_prep, escalation, renewal_alert.",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["topic", "urgency", "what_happened", "open_in_meeting"],
+        "additionalProperties": false,
+        "properties": {
+          "topic": {
+            "type": "string",
+            "description": "Short label, ideally citing a real artifact (deal name, case #, contact)."
+          },
+          "urgency": {
+            "type": "string",
+            "enum": ["critical", "high", "medium", "low"]
+          },
+          "what_happened": {
+            "type": "string",
+            "description": "1–2 sentences of factual context — dates, amounts, status. No narrative."
+          },
+          "open_in_meeting": {
+            "type": "string",
+            "description": "The specific question/move for THIS surface. Concrete and verbatim-ready."
+          },
+          "watch_for": {
+            "type": ["string", "null"],
+            "description": "The landmine — what NOT to do or what signal to read. Null/empty if none."
+          },
+          "sources": { "$ref": "#/$defs/sources" }
+        }
+      }
+    },
+
+    "pipeline": {
+      "type": "object",
+      "description": "Active deal state. Used by: meeting_prep, qbr, handoff, renewal_alert.",
+      "additionalProperties": false,
+      "properties": {
+        "total_active_mrr": {
+          "type": ["string", "null"],
+          "description": "Formatted dollar amount of open opps. Null when none."
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "stage"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "amount": { "type": ["string", "null"] },
+              "stage": { "type": "string" },
+              "close_date": { "type": ["string", "null"] },
+              "probability": { "type": ["number", "null"] },
+              "sf_opp_id": { "type": ["string", "null"] },
+              "next_step": {
+                "type": ["string", "null"],
+                "description": "SF Opportunity.NextStep field. Often null. When present, the rep's explicit note on the next move for this deal."
+              },
+              "sources": { "$ref": "#/$defs/sources" }
+            }
+          }
+        }
+      }
+    },
+
+    "support_health": {
+      "type": "object",
+      "description": "Open support / escalation state. Used by: escalation, qbr, handoff, renewal_alert.",
+      "additionalProperties": false,
+      "properties": {
+        "open_cases_count": { "type": "integer", "minimum": 0 },
+        "open_p1_count": { "type": "integer", "minimum": 0 },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["case_number", "subject", "priority", "status"],
+            "additionalProperties": false,
+            "properties": {
+              "case_number": { "type": "string" },
+              "subject": { "type": "string" },
+              "priority": {
+                "type": ["string", "null"],
+                "enum": ["P1", "P2", "P3", "P4", null],
+                "description": "SF Case.Priority. Null is legitimate — bot-filed cases (RBL notices, abuse-bot tickets) frequently come back with no priority set. The model should pass null through rather than guessing a tier."
+              },
+              "status": { "type": "string" },
+              "opened_at": { "type": ["string", "null"] },
+              "last_updated_at": { "type": ["string", "null"] },
+              "sf_case_id": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "trend": {
+          "type": ["string", "null"],
+          "enum": ["improving", "stable", "degrading", null],
+          "description": "Whether ticket volume / severity is trending well over the look-back window."
+        }
+      }
+    },
+
+    "relationship_map": {
+      "type": "object",
+      "description": "Who matters and how. champions/blockers/neutral describe DISPOSITION toward us; decision_makers describes AUTHORITY (often orthogonal — a decision-maker can be a champion, a blocker, or neutral). new_contacts surfaces first-seen-in-window faces. Used by: handoff, onboarding, qbr, renewal_alert.",
+      "additionalProperties": false,
+      "properties": {
+        "champions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/contact" }
+        },
+        "blockers": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/contact" }
+        },
+        "neutral": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/contact" }
+        },
+        "decision_makers": {
+          "type": "array",
+          "description": "Contacts with explicit decision authority — sign-off on contracts, capacity commitments, architecture choices. Orthogonal to champions/blockers (a decision-maker can be either or neither in disposition). Use sparingly: only when authority is established in the source data, not inferred from title alone.",
+          "items": { "$ref": "#/$defs/contact" }
+        },
+        "new_contacts": {
+          "type": "array",
+          "description": "Contacts surfaced for the first time in this brief's look-back window.",
+          "items": { "$ref": "#/$defs/contact" }
+        }
+      }
+    },
+
+    "recent_activity": {
+      "type": "array",
+      "description": "Factual record of recent touchpoints. Used by: meeting_prep, qbr, handoff, onboarding, escalation.",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "required": ["date", "type", "summary"],
+        "additionalProperties": false,
+        "properties": {
+          "date": { "type": "string" },
+          "type": {
+            "type": "string",
+            "enum": [
+              "meeting",
+              "call",
+              "email",
+              "support",
+              "quote",
+              "note",
+              "teams_message",
+              "opportunity_event",
+              "case_event",
+              "internal_note"
+            ],
+            "description": "Activity category. opportunity_event covers SF opp lifecycle (created, stage-change, closed); case_event covers SF case lifecycle (created, escalated, closed). internal_note is a rep-authored observation outside SF — typically from a handoff dossier or QBR-prep memo."
+          },
+          "summary": { "type": "string" },
+          "sources": { "$ref": "#/$defs/sources" }
+        }
+      }
+    },
+
+    "external_signal": {
+      "type": "object",
+      "description": "Signal from outside Zenlayer's own systems. Used by: meeting_prep, qbr, renewal_alert.",
+      "additionalProperties": false,
+      "properties": {
+        "news": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "required": ["headline", "relevance"],
+            "additionalProperties": false,
+            "properties": {
+              "headline": { "type": "string" },
+              "source": { "type": ["string", "null"], "description": "Publication name." },
+              "url": { "type": ["string", "null"] },
+              "published_at": { "type": ["string", "null"] },
+              "relevance": {
+                "type": "string",
+                "description": "Why this matters for the brief's surface."
+              }
+            }
+          }
+        },
+        "internal_chatter": {
+          "type": "array",
+          "description": "Signal from internal Teams channels + SharePoint that's NOT in SF.",
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "required": ["source", "headline", "implication"],
+            "additionalProperties": false,
+            "properties": {
+              "source": { "type": "string", "enum": ["teams", "sharepoint", "email"] },
+              "headline": { "type": "string" },
+              "context": { "type": ["string", "null"], "description": "Channel / doc name + date." },
+              "implication": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+
+    "knowledge_context": {
+      "type": "array",
+      "description": "Internal playbooks / case studies relevant to the surface. Used by: meeting_prep, onboarding, qbr.",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "required": ["title", "relevance"],
+        "additionalProperties": false,
+        "properties": {
+          "title": { "type": "string" },
+          "url": { "type": ["string", "null"] },
+          "relevance": { "type": "string" }
+        }
+      }
+    },
+
+    "pricing_history": {
+      "type": "object",
+      "description": "Quote / deal pricing context. Used by: meeting_prep, qbr, renewal_alert. Two arrays here: recent_quotes is QUOTE-LEVEL (pricing_quotes table rows with display_id like SQUSWyyyymmddNNN); period_breakdown is BILLING-LEVEL (pricing_historical rows, per period × product_line × dc_code). Don't conflate them.",
+      "additionalProperties": false,
+      "properties": {
+        "summary": { "type": "string", "description": "1 sentence on the account's quote + billing pattern. Period-over-period trajectory or quote cadence." },
+        "recent_quotes": {
+          "type": "array",
+          "description": "Quote-level records from pricing_quotes — one entry per quote the rep authored. NOT per billing period; use period_breakdown for that.",
+          "maxItems": 5,
+          "items": {
+            "type": "object",
+            "required": ["display_id", "created_at", "summary"],
+            "additionalProperties": false,
+            "properties": {
+              "display_id": {
+                "type": "string",
+                "description": "SQUSWyyyymmddNNN-style ID from pricing_quotes.display_id. Quote-level, not line-item."
+              },
+              "created_at": { "type": "string" },
+              "summary": {
+                "type": "string",
+                "description": "1-line description of what was quoted — multi-line / multi-metro deals condense to one phrase."
+              },
+              "amount": { "type": ["string", "null"], "description": "Total of the quote (formatted, e.g. '$42,000 MRR'). Null if MRR isn't the right summary." }
+            }
+          }
+        },
+        "period_breakdown": {
+          "type": "array",
+          "description": "Period-over-period billing roll-up from pricing_historical. One entry per (period × product_line × dc_code) combination. Used by QBR briefs to show trajectory.",
+          "maxItems": 30,
+          "items": {
+            "type": "object",
+            "required": ["period", "product_line", "mrc_usd"],
+            "additionalProperties": false,
+            "properties": {
+              "period": { "type": "string", "description": "Period label — 'Q1 2026', '2025-10', '2026-H1', etc." },
+              "product_line": { "type": "string" },
+              "dc_code": { "type": ["string", "null"] },
+              "mrc_usd": { "type": ["number", "null"] },
+              "nrc_usd": { "type": ["number", "null"] },
+              "note": { "type": ["string", "null"], "description": "Optional 1-line context — e.g. 'first deployment', 'capacity uplift', 'churn-out'." }
+            }
+          }
+        }
+      }
+    },
+
+    "renewal": {
+      "type": "object",
+      "description": "Renewal posture. Required for renewal_alert; useful for qbr.",
+      "additionalProperties": false,
+      "properties": {
+        "next_renewal_date": { "type": ["string", "null"] },
+        "contract_value": { "type": ["string", "null"] },
+        "days_to_renewal": { "type": ["integer", "null"] },
+        "expansion_signals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["signal"],
+            "additionalProperties": false,
+            "properties": {
+              "signal": { "type": "string" },
+              "sources": { "$ref": "#/$defs/sources" }
+            }
+          }
+        },
+        "risk_signals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["signal", "severity"],
+            "additionalProperties": false,
+            "properties": {
+              "signal": { "type": "string" },
+              "severity": { "type": "string", "enum": ["critical", "high", "medium", "low"] },
+              "sources": { "$ref": "#/$defs/sources" }
+            }
+          }
+        },
+        "sentiment": {
+          "type": ["string", "null"],
+          "enum": ["positive", "neutral", "at_risk", "churn_likely", null]
+        }
+      }
+    },
+
+    "timeline": {
+      "type": "array",
+      "description": "Chronological key events. Used by: handoff, onboarding — gives a new owner the narrative arc.",
+      "maxItems": 15,
+      "items": {
+        "type": "object",
+        "required": ["date", "event"],
+        "additionalProperties": false,
+        "properties": {
+          "date": { "type": "string" },
+          "event": { "type": "string", "description": "1 sentence: what happened, why it mattered." },
+          "category": {
+            "type": ["string", "null"],
+            "enum": ["acquisition", "expansion", "incident", "leadership_change", "milestone", "renewal", null]
+          },
+          "sources": { "$ref": "#/$defs/sources" }
+        }
+      }
+    },
+
+    "asks_and_next_steps": {
+      "type": "array",
+      "description": "Concrete actions / decisions outstanding. Used by every surface.",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "required": ["action", "owner"],
+        "additionalProperties": false,
+        "properties": {
+          "action": { "type": "string" },
+          "owner": { "type": "string", "description": "Who needs to do this — name or role." },
+          "due_by": { "type": ["string", "null"] },
+          "status": {
+            "type": ["string", "null"],
+            "enum": ["open", "in_progress", "blocked", "done", null]
+          },
+          "sources": { "$ref": "#/$defs/sources" }
+        }
+      }
+    },
+
+    "landmines": {
+      "type": "array",
+      "description": "Things to AVOID / watch for in this surface. Used by: meeting_prep, handoff, renewal_alert.",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "required": ["landmine", "why"],
+        "additionalProperties": false,
+        "properties": {
+          "landmine": { "type": "string", "description": "What not to do, in one phrase. Field name is 'landmine' (NOT 'description' or 'issue')." },
+          "why": { "type": "string", "description": "The history / context behind it." },
+          "severity": {
+            "type": ["string", "null"],
+            "enum": ["critical", "high", "medium", "low", null],
+            "description": "Optional — how much damage the landmine causes if stepped on. Matches the severity scale on renewal.risk_signals."
+          },
+          "sources": { "$ref": "#/$defs/sources" }
+        }
+      }
+    },
+
+    "talking_points": {
+      "type": "array",
+      "description": "Suggested conversation threads — different from must_address (which is the hard agenda). Used by: meeting_prep, qbr.",
+      "maxItems": 5,
+      "items": { "type": "string" }
+    },
+
+    "carryover": {
+      "type": ["string", "null"],
+      "description": "Lines from a prior brief on this account that are still live. Used by: meeting_prep (refresh), qbr (period-over-period)."
+    },
+
+    "meeting_opener": {
+      "type": ["string", "null"],
+      "description": "ONE sentence of strategic framing for how to open the conversation. Used by: meeting_prep only."
+    }
+  },
+
+  "$defs": {
+    "contact": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "title": { "type": ["string", "null"] },
+        "email": { "type": ["string", "null"] },
+        "engagement": {
+          "type": ["string", "null"],
+          "enum": ["active", "passive", "unknown", null]
+        },
+        "note": { "type": ["string", "null"], "description": "One-line context on how they fit." },
+        "sf_contact_id": { "type": ["string", "null"] },
+        "sources": {
+          "$ref": "#/$defs/sources",
+          "description": "Optional per-contact source attribution. Useful when a contact's role or engagement signal comes from a specific upstream record (e.g. 'first appeared on email thread X' or 'title pulled from LinkedIn profile')."
+        }
+      }
+    },
+    "sources": {
+      "type": "array",
+      "description": "Source attribution for a specific claim. Lets us trace any factual line back to its upstream record. Optional on every section but strongly encouraged — claims without sources are downgraded in the confidence score.",
+      "items": {
+        "type": "object",
+        "required": ["type"],
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "sf_account",
+              "sf_opp",
+              "sf_contact",
+              "sf_activity",
+              "sf_case",
+              "teams",
+              "sharepoint",
+              "knowledge",
+              "news",
+              "pricing_history",
+              "prior_prep",
+              "calendar",
+              "email",
+              "internal_note"
+            ]
+          },
+          "ref": {
+            "type": ["string", "null"],
+            "description": "Upstream identifier — case number, opp ID, message permalink, doc URL, etc. NULL when the source type doesn't carry stable IDs (e.g. some Teams chatter)."
+          },
+          "snippet": {
+            "type": ["string", "null"],
+            "description": "Optional ≤200-char excerpt for ground-truth verification. Not for rendering to the user — for training-data audit and eval."
+          }
+        }
+      }
+    }
+  }
+}
