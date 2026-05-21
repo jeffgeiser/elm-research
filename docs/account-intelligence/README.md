@@ -1,6 +1,6 @@
 # Account Intelligence Model — Phase 1 artifacts
 
-A fine-tuned ~4B model specialized in account intelligence synthesis,
+A fine-tuned 7B model specialized in account intelligence synthesis,
 covering six enterprise surfaces:
 
 1. **meeting_prep** — pre-call briefing
@@ -54,7 +54,7 @@ schema.json ────────► every training example MUST conform
 3. **Manually validate a 50-example eval split.** Hand-check every
    example against its source data. This becomes the locked
    eval set.
-4. **Train.** Qwen 2.5 4B base, LoRA, on a single H100. The 600
+4. **Train.** Qwen2.5-7B-Instruct base, LoRA, on DGX Spark (H100). The ~570
    examples should fit comfortably in a few-hour run.
 5. **Score against `evaluation.md`.** Iterate until v0.1 thresholds
    are met.
