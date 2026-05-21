@@ -30,20 +30,32 @@ Use ONLY the field names defined in the schema. The schema enforces `additionalP
 
 - `account.owner` / `account.billing_country` / `account.arr_usd` / `account.employee_count` — Owner / country / revenue / size belong inside `relationship_map.champions[].note` or `talking_points` as prose.
 - `pipeline.items[].owner` / `pipeline.items[].account_owner` / `pipeline.items[].type` / `pipeline.items[].mrr_impact` / `pipeline.items[].note` — only `name`, `amount`, `stage`, `close_date`, `probability`, `sf_opp_id`, `next_step`, `sources` exist.
+- `pipeline.items[].amount` — MUST be a **string** (e.g. `"$210,000 MRR"`), never a bare number. Null is also valid. Do not emit `210000` — emit `"$210,000 MRR"`.
 - `support_health.csat_score` / `support_health.open_cases` / `support_health.recent_closed` / `support_health.open_cases_summary` / `support_health.note` — Zenlayer doesn't track CSAT in SF. The schema has only `open_cases_count`, `open_p1_count`, `items`, `trend`.
+- `support_health.items[]` — valid fields ONLY: `case_number`, `subject`, `priority`, `status`, `opened_at`, `last_updated_at`, `sf_case_id`. No `sources`, no `opened_date`, no `description`, no other fields.
 - `relationship_map.detractors` / `relationship_map.influencers` / `relationship_map.unknown` — the only buckets are `champions`, `blockers`, `neutral`, `decision_makers`, `new_contacts`. Map detractors → blockers; influencers → champions; unknown → neutral.
+- `relationship_map` contact objects — valid fields ONLY: `name`, `title`, `email`, `engagement`, `note`, `sf_contact_id`, `sources`. Do NOT add `department`, `role`, `region`, `team`, or any other field. Put department/team context in the `note` field.
+- `contact.engagement` — ENUM ONLY: `"active"`, `"passive"`, `"unknown"`, or `null`. Do NOT use `"low"`, `"medium"`, `"high"`, `"stale"`, `"dark"`, or any other value. Map engagement intensity to prose in the `note` field instead.
 - `knowledge_context[].content` / `knowledge_context[].excerpt` / `knowledge_context[].snippet` — schema has only `title`, `url`, `relevance`. If the chunk content matters, put it in `relevance` as one sentence.
+- `external_signal` has ONLY two valid keys: `news[]` and `internal_chatter[]`. Do NOT add `triggers`, `signals`, `alerts`, `events`, or any other top-level key.
 - `_meta.confidence` / `_meta.model_version` — `_meta` is free-form for annotation but the rest of the schema is strict.
 
 **Field-name precision matters — these are the common name slips:**
 
 - `external_signal.news[].source` — NOT `source_name`. The string field is `source` (e.g. `"Variety"`, `"Reuters"`).
 - `landmines[].landmine` + `landmines[].why` — both REQUIRED. Field names are literally `landmine` (NOT `description`/`issue`/`risk`) and `why` (NOT `rationale`/`reason`/`context`). Severity is optional, sources is optional, the two text fields are not.
-- `must_address[].topic` — NOT `title` / `headline`. Short label of the topic.
+- `must_address[].topic` — NOT `title` / `headline`. Short label of the topic. Full required shape: `topic` (string), `urgency` (string: `critical|high|medium|low`), `what_happened` (string: 1-2 sentence factual summary), `open_in_meeting` (string: the SPECIFIC verbatim question or move to make in this surface, e.g. `"Ask Marcus to confirm the Tokyo expansion timeline before Q3 budget freeze"` — NOT a boolean). Optional: `watch_for` (string), `sources` (array of source objects). Do NOT add a `detail` field — it does not exist.
 - `support_health.items[].subject` — NOT `description` / `case_subject`. Matches SF Case.Subject.
 - `asks_and_next_steps[].due_by` — NOT `by_when` / `deadline` / `due_date` / `target_date`. ISO-shape date string or null.
+- `asks_and_next_steps[].action` — NOT `ask` / `task` / `item`. Required fields are `action` (string) and `owner` (string). Optional: `due_by`, `status`, `sources`.
+- `asks_and_next_steps[].status` — ENUM ONLY: `"open"`, `"in_progress"`, `"blocked"`, `"done"`, or `null`. Do NOT use `"not_started"`, `"pending"`, `"todo"`, or any other value.
 - `renewal.next_renewal_date` — NOT `renewal.date`. Full field name. Pair with `renewal.days_to_renewal` (number) and `renewal.contract_value` (string).
 - `renewal` block has NO `summary` field — the summary lives in the top-level `executive_summary`. The `renewal` block is structured: `next_renewal_date`, `contract_value`, `days_to_renewal`, `expansion_signals[]`, `risk_signals[]`, `sentiment`.
+- `renewal.sentiment` — ENUM ONLY: `"positive"`, `"neutral"`, `"at_risk"`, `"churn_likely"`, or `null`. Do NOT invent values like `"positive_with_risk"`, `"cautiously_positive"`, etc.
+- `renewal.risk_signals[]` — each entry REQUIRES both `signal` (string) and `severity` (`critical|high|medium|low`). Do NOT omit `severity`.
+- `pipeline` has NO `summary` field at top level — only `items[]`. If you want to summarize pipeline, put it in `executive_summary` or `talking_points`.
+- `carryover` is a plain **string** (or null) — NOT a structured object. Write it as a prose paragraph or bullet list in a single string. Do not emit `from_surface`, `generated_at`, `items`, or any nested structure.
+- `timeline` is a plain **array** — NOT an object. Do NOT wrap it in `{"items": [...]}` or `{"events": [...]}`. Emit the array directly: `"timeline": [{...}, {...}]`. Each item requires `date` (string) and `event` (string: 1 sentence). Optional: `category` (enum: `acquisition`, `expansion`, `incident`, `leadership_change`, `milestone`, `renewal`, or null) and `sources`. No `status`, `label`, `detail`, or any other fields.
 
 If you want to include information that no schema field captures, surface it inside a `note` field on an existing object (most objects have one) or in `talking_points`. Don't invent properties.
 
@@ -54,7 +66,7 @@ The schema has two distinct source-attribution surfaces. Get them right:
 **`sources_used` (top-level, REQUIRED)** — an array of **strings**, each being one of the source-type names from the table further below. This is the high-level "what categories of data fed this brief" list. Example:
 
 ```json
-"sources_used": ["sf_account", "sf_opps", "sf_cases", "pricing_history"]
+"sources_used": ["sf_account", "sf_opp", "sf_case", "pricing_history"]
 ```
 
 **`sources` (per-claim, optional everywhere it appears)** — an array of **objects**, each with `type`, `ref`, and optional `snippet`. This is the per-claim attribution: each item in `must_address[]`, each `recent_activity[]` entry, each `landmines[]` entry, each `renewal.risk_signals[]` entry, etc. Example:
@@ -191,6 +203,9 @@ These rules are non-negotiable:
 - **No marketing voice.** Forbid: "robust", "comprehensive", "industry-leading", "cutting-edge", "synergy", "alignment opportunity". Forbid "as we discussed", "circling back", "touch base".
 - **Differentiate must_address from pipeline.** must_address is "what to drive in this surface" — one topic per entry, action-oriented, sourced. pipeline is the factual record of open opps — no narrative, no next-step prose. If "next step needed" wants to go in pipeline, that signal belongs in must_address.
 - **3-5 must_address entries.** Rank by urgency. Empty array if nothing material is honest; padding is dishonest.
+- **`recent_activity[].type` is a strict enum.** Valid values ONLY: `meeting`, `call`, `email`, `support`, `quote`, `note`, `teams_message`, `opportunity_event`, `case_event`, `internal_note`. Do NOT use `case_opened`, `teams_dm`, `quote_issued`, `slack_message`, or any other value.
+- **`talking_points` is capped at 5 items.** Emit at most 5 strings. If you have more points, fold them into `must_address` or `asks_and_next_steps`.
+- **`account` has no `tier` field, no `website`, no `owner`, no `region`.** The only valid account fields are `name`, `type`, `industry`, `cid`, `sf_account_id`. Everything else belongs in `relationship_map` or `talking_points`.
 - **Don't invent URLs.** Pull URLs only from sources that have them (news, knowledge_context). For SF records, URLs aren't typically present in the projection; leave them null.
 - **Confidence is calibrated.** `high` = every claim traces to a source. `medium` = some inference. `low` = significant data gaps. Match the rationale honestly to the confidence tier.
 

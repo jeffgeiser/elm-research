@@ -323,7 +323,8 @@ def generate_one(
             for e in errors[:15]
         )
         result.errors_log.append(
-            f"attempt {attempt + 1}: {len(errors)} schema errors"
+            f"attempt {attempt + 1}: {len(errors)} schema errors\n"
+            + "\n".join(f"  - at {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors[:15])
         )
         messages.extend(
             [
@@ -416,6 +417,11 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Print matrix + cost estimate; don't call the API.",
+    )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print validation errors for retried-but-succeeded examples.",
     )
     p.add_argument(
         "--dataset-dir",
@@ -549,6 +555,9 @@ def main() -> int:
                 f"  ✓ {path.name} ({result.elapsed_s:.1f}s, "
                 f"{result.attempts} attempt(s))"
             )
+            if args.verbose and result.errors_log:
+                for log in result.errors_log:
+                    print(f"    {log}")
             successes += 1
             next_id += 1
 
