@@ -3,7 +3,11 @@
 *.env
 
 # Dataset examples — may contain real customer data
-datasets/
+datasets/*
+!datasets/account-intelligence/
+datasets/account-intelligence/*
+# Exception: eval split is just IDs, must be reproducible across machines
+!datasets/account-intelligence/eval_split.txt
 
 # Python
 __pycache__/
