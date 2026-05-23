@@ -22,3 +22,7 @@ FAILED-*.txt
 
 # uv
 uv.lock
+
+# Training outputs
+train/data/
+train/runs/
