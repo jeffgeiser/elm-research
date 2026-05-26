@@ -53,10 +53,10 @@ echo "Log:      $LOG_PATH"
 echo "VRAM log: $RUN_DIR/vram.log"
 echo
 
-# The `script` command preserves color + flushes line-by-line — better than
-# plain `tee` for following progress bars.
+# Use tee for cross-platform logging. PYTHONUNBUFFERED keeps progress
+# lines flushing in real time without needing `script`.
 tmux new-session -d -s "$SESSION" -c "$ROOT" \
-    "script -q -f '$LOG_PATH' uv run python train/train_lora.py --run-name '$RUN_NAME'"
+    "PYTHONUNBUFFERED=1 uv run python train/train_lora.py --run-name '$RUN_NAME' 2>&1 | tee '$LOG_PATH'"
 
 echo "Started. Attach with:  tmux attach -t $SESSION"
 echo "Follow log with:       tail -f $LOG_PATH"
