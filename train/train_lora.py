@@ -37,7 +37,7 @@ from unsloth import FastLanguageModel  # noqa: E402
 import torch  # noqa: E402
 from datasets import load_dataset  # noqa: E402
 from transformers import TrainingArguments, TrainerCallback  # noqa: E402
-from trl import SFTTrainer  # noqa: E402
+from trl import SFTTrainer, DataCollatorForCompletionOnlyLM  # noqa: E402
 
 
 HERE = Path(__file__).parent.resolve()
@@ -62,19 +62,25 @@ TARGET_MODULES = [
     "gate_proj", "up_proj", "down_proj",
 ]
 
-LEARNING_RATE = 2e-4
+LEARNING_RATE = 1e-4     # was 2e-4; dropped after round 1 over-memorized prompts
 PER_DEVICE_BATCH = 1     # conservative at seq_len=16k; can bump to 2 if VRAM allows
 GRAD_ACCUM_STEPS = 16    # keep effective batch = 16
 NUM_EPOCHS = 1
-WARMUP_STEPS = 10
+WARMUP_STEPS = 5         # ~15% of total ~33 steps
 WEIGHT_DECAY = 0.01
 LR_SCHEDULER = "cosine"
 
-# Save + eval cadence
-SAVE_STEPS = 50
-EVAL_STEPS = 50
-LOGGING_STEPS = 5
-VRAM_LOG_INTERVAL = 50   # log peak VRAM every N steps
+# Save + eval cadence — sized for ~33-step runs
+SAVE_STEPS = 10
+EVAL_STEPS = 10
+LOGGING_STEPS = 1
+VRAM_LOG_INTERVAL = 5    # log peak VRAM every N steps
+
+# Response template — the chat-template marker that prefixes the assistant
+# turn for Qwen2.5. Used by DataCollatorForCompletionOnlyLM to mask the
+# system + user prefix from the loss. Without this, the model learns to
+# regenerate the prompt instead of the brief.
+RESPONSE_TEMPLATE = "<|im_start|>assistant\n"
 
 
 # ---- VRAM logging callback --------------------------------------------------
@@ -285,6 +291,15 @@ def main() -> int:
         optim="adamw_8bit",
     )
 
+    # Completion-only loss: mask everything up to and including the
+    # assistant marker. Without this, training learns to regenerate the
+    # system prompt instead of the brief (observed empirically in round 1
+    # — model collapsed into prompt-regurgitation + repetition loops).
+    collator = DataCollatorForCompletionOnlyLM(
+        response_template=RESPONSE_TEMPLATE,
+        tokenizer=tokenizer,
+    )
+
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -292,6 +307,7 @@ def main() -> int:
         eval_dataset=eval_ds,
         max_seq_length=MAX_SEQ_LENGTH,
         dataset_text_field="text",
+        data_collator=collator,
         packing=False,
         args=targs,
     )
