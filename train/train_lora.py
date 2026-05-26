@@ -36,8 +36,10 @@ from unsloth import FastLanguageModel  # noqa: E402
 
 import torch  # noqa: E402
 from datasets import load_dataset  # noqa: E402
+import numpy as np  # noqa: E402
 from transformers import TrainingArguments, TrainerCallback  # noqa: E402
-from trl import SFTTrainer, DataCollatorForCompletionOnlyLM  # noqa: E402
+from transformers import DataCollatorForLanguageModeling  # noqa: E402
+from trl import SFTTrainer  # noqa: E402
 
 
 HERE = Path(__file__).parent.resolve()
@@ -81,6 +83,45 @@ VRAM_LOG_INTERVAL = 5    # log peak VRAM every N steps
 # system + user prefix from the loss. Without this, the model learns to
 # regenerate the prompt instead of the brief.
 RESPONSE_TEMPLATE = "<|im_start|>assistant\n"
+
+
+# ---- Completion-only collator ----------------------------------------------
+
+class CompletionOnlyCollator(DataCollatorForLanguageModeling):
+    """Mask everything before the response template with -100 so loss is
+    only computed on the assistant turn.
+
+    Equivalent to TRL's old DataCollatorForCompletionOnlyLM, inlined here
+    because that class was removed from TRL's public API in 0.20+.
+    """
+
+    def __init__(self, response_template: str, tokenizer, ignore_index: int = -100):
+        super().__init__(tokenizer=tokenizer, mlm=False)
+        self.response_token_ids = tokenizer.encode(
+            response_template, add_special_tokens=False
+        )
+        self.ignore_index = ignore_index
+
+    def torch_call(self, examples):
+        batch = super().torch_call(examples)
+        for i in range(batch["labels"].size(0)):
+            labels = batch["labels"][i]
+            n = len(self.response_token_ids)
+            first = self.response_token_ids[0]
+            response_end = None
+            # Find the response-template subsequence (use the LAST hit so
+            # any prior occurrence of the marker text is ignored).
+            for idx in np.where(labels.cpu().numpy() == first)[0]:
+                window = labels[idx : idx + n].tolist()
+                if window == self.response_token_ids:
+                    response_end = idx + n
+            if response_end is None:
+                # Marker not found — fail closed: mask everything so this
+                # example contributes no loss rather than train on the prompt.
+                batch["labels"][i, :] = self.ignore_index
+            else:
+                batch["labels"][i, :response_end] = self.ignore_index
+        return batch
 
 
 # ---- VRAM logging callback --------------------------------------------------
@@ -295,7 +336,7 @@ def main() -> int:
     # assistant marker. Without this, training learns to regenerate the
     # system prompt instead of the brief (observed empirically in round 1
     # — model collapsed into prompt-regurgitation + repetition loops).
-    collator = DataCollatorForCompletionOnlyLM(
+    collator = CompletionOnlyCollator(
         response_template=RESPONSE_TEMPLATE,
         tokenizer=tokenizer,
     )
