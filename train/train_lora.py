@@ -246,12 +246,21 @@ def main() -> int:
     # ---- Datasets ----
     train_ds = load_dataset("json", data_files=str(args.train_jsonl), split="train")
     eval_ds = load_dataset("json", data_files=str(args.eval_jsonl), split="train")
-    # Drop the "id" column from what the trainer sees — it doesn't need
-    # it (the post-ckpt callback reads eval.jsonl directly for IDs).
-    if "id" in train_ds.column_names:
-        train_ds = train_ds.remove_columns(["id"])
-    if "id" in eval_ds.column_names:
-        eval_ds = eval_ds.remove_columns(["id"])
+
+    # Pre-apply the chat template to a "text" column. Unsloth's SFTTrainer
+    # requires an explicit formatting target — auto-detect from "messages"
+    # is unreliable across TRL/Unsloth versions.
+    def to_text(example):
+        return {
+            "text": tokenizer.apply_chat_template(
+                example["messages"],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        }
+
+    train_ds = train_ds.map(to_text, remove_columns=train_ds.column_names)
+    eval_ds = eval_ds.map(to_text, remove_columns=eval_ds.column_names)
     print(f"Train: {len(train_ds)}  Eval: {len(eval_ds)}")
 
     # ---- Training args ----
@@ -282,7 +291,7 @@ def main() -> int:
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         max_seq_length=MAX_SEQ_LENGTH,
-        dataset_text_field=None,  # SFTTrainer infers from chat-format messages
+        dataset_text_field="text",
         packing=False,
         args=targs,
     )
