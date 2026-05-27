@@ -37,9 +37,9 @@ from unsloth import FastLanguageModel  # noqa: E402
 import torch  # noqa: E402
 from datasets import load_dataset  # noqa: E402
 import numpy as np  # noqa: E402
-from transformers import TrainingArguments, TrainerCallback  # noqa: E402
+from transformers import TrainerCallback  # noqa: E402
 from transformers import DataCollatorForLanguageModeling  # noqa: E402
-from trl import SFTTrainer  # noqa: E402
+from trl import SFTTrainer, SFTConfig  # noqa: E402
 
 
 HERE = Path(__file__).parent.resolve()
@@ -388,7 +388,11 @@ def main() -> int:
     print(f"Train: {len(train_ds)}  Eval: {len(eval_ds)}")
 
     # ---- Training args ----
-    targs = TrainingArguments(
+    # Use SFTConfig (not TrainingArguments) so max_seq_length is actually
+    # honored. In TRL 0.20+, max_seq_length passed directly to SFTTrainer
+    # is ignored — it has to come through SFTConfig. Round 3 silently
+    # truncated to 1024 because of this.
+    targs = SFTConfig(
         output_dir=str(run_dir),
         per_device_train_batch_size=PER_DEVICE_BATCH,
         gradient_accumulation_steps=GRAD_ACCUM_STEPS,
@@ -407,6 +411,10 @@ def main() -> int:
         report_to="none",
         seed=42,
         optim="adamw_8bit",
+        # SFT-specific (these were being silently ignored on SFTTrainer)
+        max_seq_length=MAX_SEQ_LENGTH,
+        dataset_text_field="text",
+        packing=False,
     )
 
     # Completion-only loss: mask everything up to and including the
@@ -420,10 +428,7 @@ def main() -> int:
         tokenizer=tokenizer,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        max_seq_length=MAX_SEQ_LENGTH,
-        dataset_text_field="text",
         data_collator=collator,
-        packing=False,
         args=targs,
     )
 
