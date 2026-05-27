@@ -78,49 +78,105 @@ EVAL_STEPS = 10
 LOGGING_STEPS = 1
 VRAM_LOG_INTERVAL = 5    # log peak VRAM every N steps
 
-# Response template — the chat-template marker that prefixes the assistant
-# turn for Qwen2.5. Used by DataCollatorForCompletionOnlyLM to mask the
-# system + user prefix from the loss. Without this, the model learns to
-# regenerate the prompt instead of the brief.
-RESPONSE_TEMPLATE = "<|im_start|>assistant\n"
+# Completion-only masking uses Qwen2.5 special tokens directly inside the
+# CompletionOnlyCollator (no string template needed).
 
 
 # ---- Completion-only collator ----------------------------------------------
 
 class CompletionOnlyCollator(DataCollatorForLanguageModeling):
-    """Mask everything before the response template with -100 so loss is
-    only computed on the assistant turn.
+    """Mask everything before the assistant turn with -100 so loss is only
+    computed on the assistant content.
 
-    Equivalent to TRL's old DataCollatorForCompletionOnlyLM, inlined here
-    because that class was removed from TRL's public API in 0.20+.
+    Uses Qwen2.5's special token IDs directly (<|im_start|> + role name)
+    rather than string-encoding the template, which proved brittle: the
+    BPE tokenization of a standalone template string can differ from how
+    those tokens appear mid-sequence after apply_chat_template.
+
+    Verifies on init that the marking strategy actually works against a
+    sample chat sequence — fails loudly rather than silently masking
+    everything (which round 2 did, producing train_loss=0).
     """
 
-    def __init__(self, response_template: str, tokenizer, ignore_index: int = -100):
+    def __init__(self, tokenizer, ignore_index: int = -100):
         super().__init__(tokenizer=tokenizer, mlm=False)
-        self.response_token_ids = tokenizer.encode(
-            response_template, add_special_tokens=False
-        )
         self.ignore_index = ignore_index
+
+        # Resolve Qwen2.5 special tokens
+        self.im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        if self.im_start_id is None or self.im_start_id == tokenizer.unk_token_id:
+            raise RuntimeError(
+                "Tokenizer has no <|im_start|> special token — this collator "
+                "only supports Qwen2.5-style chat templates."
+            )
+        # "assistant" tokenizes to one or more BPE pieces. Capture them
+        # so we can verify the role name follows <|im_start|>.
+        self.assistant_role_ids = tokenizer.encode("assistant", add_special_tokens=False)
+
+        # Self-test on a synthetic sequence. If masking would mask EVERYTHING
+        # or NOTHING, refuse to construct.
+        sample_text = tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": "S"},
+                {"role": "user", "content": "U"},
+                {"role": "assistant", "content": "ASSISTANT_CONTENT_MARKER"},
+            ],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        sample_ids = tokenizer.encode(sample_text, add_special_tokens=False)
+        cutoff = self._find_assistant_cutoff(sample_ids)
+        if cutoff is None:
+            raise RuntimeError(
+                "Self-test FAILED: could not find assistant role marker in "
+                f"sample tokenization. im_start_id={self.im_start_id}, "
+                f"assistant_role_ids={self.assistant_role_ids}, "
+                f"sample_ids tail={sample_ids[-30:]}"
+            )
+        if cutoff >= len(sample_ids):
+            raise RuntimeError(
+                f"Self-test FAILED: cutoff {cutoff} is at or past end of "
+                f"sample (len={len(sample_ids)}) — no assistant content to "
+                "compute loss on."
+            )
+        print(
+            f"[collator] self-test OK: cutoff={cutoff}/{len(sample_ids)} "
+            f"(mask {cutoff} prefix tokens, train on {len(sample_ids)-cutoff} suffix)"
+        )
+
+    def _find_assistant_cutoff(self, ids):
+        """Return the index right after `<|im_start|>assistant\\n` for the
+        LAST assistant turn. Returns None if not found."""
+        n_role = len(self.assistant_role_ids)
+        last_cutoff = None
+        for pos in range(len(ids) - n_role - 1):
+            if ids[pos] != self.im_start_id:
+                continue
+            if ids[pos + 1 : pos + 1 + n_role] != self.assistant_role_ids:
+                continue
+            # Skip the role tokens; mask through the newline that follows.
+            cutoff = pos + 1 + n_role
+            # Advance past a single \n token if present (Qwen2.5 newline = id 198).
+            if cutoff < len(ids):
+                newline_ids = self.tokenizer.encode("\n", add_special_tokens=False)
+                if newline_ids and ids[cutoff] == newline_ids[0]:
+                    cutoff += 1
+            last_cutoff = cutoff
+        return last_cutoff
 
     def torch_call(self, examples):
         batch = super().torch_call(examples)
         for i in range(batch["labels"].size(0)):
-            labels = batch["labels"][i]
-            n = len(self.response_token_ids)
-            first = self.response_token_ids[0]
-            response_end = None
-            # Find the response-template subsequence (use the LAST hit so
-            # any prior occurrence of the marker text is ignored).
-            for idx in np.where(labels.cpu().numpy() == first)[0]:
-                window = labels[idx : idx + n].tolist()
-                if window == self.response_token_ids:
-                    response_end = idx + n
-            if response_end is None:
-                # Marker not found — fail closed: mask everything so this
-                # example contributes no loss rather than train on the prompt.
+            labels = batch["labels"][i].cpu().tolist()
+            cutoff = self._find_assistant_cutoff(labels)
+            if cutoff is None:
+                # Fail closed: mask the whole example. The self-test in
+                # __init__ should prevent this from ever firing on
+                # well-formed data; if it does, something is wrong with
+                # an individual record.
                 batch["labels"][i, :] = self.ignore_index
             else:
-                batch["labels"][i, :response_end] = self.ignore_index
+                batch["labels"][i, :cutoff] = self.ignore_index
         return batch
 
 
@@ -336,10 +392,7 @@ def main() -> int:
     # assistant marker. Without this, training learns to regenerate the
     # system prompt instead of the brief (observed empirically in round 1
     # — model collapsed into prompt-regurgitation + repetition loops).
-    collator = CompletionOnlyCollator(
-        response_template=RESPONSE_TEMPLATE,
-        tokenizer=tokenizer,
-    )
+    collator = CompletionOnlyCollator(tokenizer=tokenizer)
 
     trainer = SFTTrainer(
         model=model,
