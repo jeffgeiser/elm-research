@@ -54,11 +54,10 @@ EVAL_SCRIPT = ROOT / "eval.py"
 # versioned alongside the run.
 
 BASE_MODEL = "unsloth/Qwen2.5-7B-Instruct-bnb-4bit"
-# Dropped from 16384 → 8192 after round 4 crashed the Spark with OOM.
-# Truncates ~25% of records (those above 8k tokens) but cuts activation
-# memory roughly in half, leaving room to coexist with vLLM on the
-# unified-memory pool. Bump back to 16384 only after stopping vLLM.
-MAX_SEQ_LENGTH = 8192
+# Restored to 16384 for sole-tenant runs (vLLM stopped). Covers p95~12k
+# and max~13.4k token records without truncation. Drop to 8192 if you
+# need to coexist with vLLM or other GPU workloads.
+MAX_SEQ_LENGTH = 16384
 
 LORA_RANK = 16
 LORA_ALPHA = 32
