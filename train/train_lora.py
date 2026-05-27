@@ -164,16 +164,37 @@ class CompletionOnlyCollator(DataCollatorForLanguageModeling):
             last_cutoff = cutoff
         return last_cutoff
 
+    _debug_dumped = False
+
     def torch_call(self, examples):
         batch = super().torch_call(examples)
+
+        # One-shot debug on the very first batch — proves the collator
+        # actually ran AND shows what's in the labels before we mask.
+        if not CompletionOnlyCollator._debug_dumped:
+            CompletionOnlyCollator._debug_dumped = True
+            print("\n=== [collator DEBUG] first batch ===")
+            print(f"input_ids shape: {tuple(batch['input_ids'].shape)}")
+            print(f"labels shape:    {tuple(batch['labels'].shape)}")
+            ids0 = batch["input_ids"][0].cpu().tolist()
+            lbl0 = batch["labels"][0].cpu().tolist()
+            already_masked = sum(1 for x in lbl0 if x == -100)
+            print(f"first example length: {len(ids0)}")
+            print(f"labels already -100 before our masking: {already_masked}")
+            im_start_positions = [i for i, t in enumerate(ids0) if t == self.im_start_id]
+            print(f"<|im_start|> positions in first example: {im_start_positions}")
+            for pos in im_start_positions:
+                role_tokens = ids0[pos + 1 : pos + 6]
+                role_decoded = self.tokenizer.decode(role_tokens, skip_special_tokens=False)
+                print(f"  pos {pos}: next tokens={role_tokens} → {role_decoded!r}")
+            cutoff = self._find_assistant_cutoff(ids0)
+            print(f"computed cutoff for first example: {cutoff}")
+            print("=== end debug ===\n")
+
         for i in range(batch["labels"].size(0)):
             labels = batch["labels"][i].cpu().tolist()
             cutoff = self._find_assistant_cutoff(labels)
             if cutoff is None:
-                # Fail closed: mask the whole example. The self-test in
-                # __init__ should prevent this from ever firing on
-                # well-formed data; if it does, something is wrong with
-                # an individual record.
                 batch["labels"][i, :] = self.ignore_index
             else:
                 batch["labels"][i, :cutoff] = self.ignore_index
