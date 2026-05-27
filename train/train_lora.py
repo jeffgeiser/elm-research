@@ -54,7 +54,11 @@ EVAL_SCRIPT = ROOT / "eval.py"
 # versioned alongside the run.
 
 BASE_MODEL = "unsloth/Qwen2.5-7B-Instruct-bnb-4bit"
-MAX_SEQ_LENGTH = 16384   # p95 ~12k, max ~13.4k; headroom for chat template tokens
+# Dropped from 16384 → 8192 after round 4 crashed the Spark with OOM.
+# Truncates ~25% of records (those above 8k tokens) but cuts activation
+# memory roughly in half, leaving room to coexist with vLLM on the
+# unified-memory pool. Bump back to 16384 only after stopping vLLM.
+MAX_SEQ_LENGTH = 8192
 
 LORA_RANK = 16
 LORA_ALPHA = 32
@@ -329,17 +333,43 @@ class PostCheckpointEvalCallback(TrainerCallback):
 
 # ---- Main -------------------------------------------------------------------
 
+def preflight_gpu_check(min_free_gb: float = 60.0) -> bool:
+    """Refuse to start if another process is hogging GPU memory. Round 4
+    crashed the system because vLLM + training exceeded the unified-memory
+    pool. Better to fail fast than burn hours setting up before OOM."""
+    if not torch.cuda.is_available():
+        print("WARN: CUDA not available — preflight skipped")
+        return True
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    free_gb = free_bytes / 1e9
+    total_gb = total_bytes / 1e9
+    print(f"[preflight] GPU memory: {free_gb:.1f} GB free of {total_gb:.1f} GB")
+    if free_gb < min_free_gb:
+        print(
+            f"ERROR: only {free_gb:.1f} GB GPU memory free, need {min_free_gb}+ GB. "
+            "Another process is using the GPU. Stop it (e.g. vLLM) or pass "
+            "--force to proceed anyway."
+        )
+        return False
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--train-jsonl", type=Path, default=DATA_DIR / "train.jsonl")
     ap.add_argument("--eval-jsonl", type=Path, default=DATA_DIR / "eval.jsonl")
     ap.add_argument("--run-name", type=str, default=None,
                     help="Subdirectory under train/runs/ (default: timestamp)")
+    ap.add_argument("--force", action="store_true",
+                    help="Skip GPU-memory preflight check")
     args = ap.parse_args()
 
     if not args.train_jsonl.exists():
         print(f"ERROR: {args.train_jsonl} not found. Run format_jsonl.py first.",
               file=sys.stderr)
+        return 1
+
+    if not args.force and not preflight_gpu_check():
         return 1
 
     run_name = args.run_name or dt.datetime.now().strftime("%Y%m%d-%H%M%S")
