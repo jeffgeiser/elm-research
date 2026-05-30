@@ -5,6 +5,8 @@
 #     cd ~/elm-research
 #     ./train/run.sh                          # default: timestamped run name
 #     ./train/run.sh my-run-name              # custom run name
+#     ./train/run.sh round4 --resume-from-checkpoint train/runs/round3-clean/checkpoint-10
+#         # resume: any args after the run name are forwarded to train_lora.py
 #
 # Attach later:
 #     tmux attach -t elm-train
@@ -27,6 +29,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
 
 RUN_NAME="${1:-$(date +%Y%m%d-%H%M%S)}"
+# Any args after the run name are forwarded verbatim to train_lora.py
+# (e.g. --resume-from-checkpoint, --force).
+EXTRA_ARGS=("${@:2}")
 RUN_DIR="$HERE/runs/$RUN_NAME"
 mkdir -p "$RUN_DIR"
 LOG_PATH="$RUN_DIR/train.log"
@@ -55,8 +60,14 @@ echo
 
 # Use tee for cross-platform logging. PYTHONUNBUFFERED keeps progress
 # lines flushing in real time without needing `script`.
+# Build the forwarded-args string (quoted) for the tmux command line.
+EXTRA_STR=""
+for a in "${EXTRA_ARGS[@]}"; do
+    EXTRA_STR+=" '$a'"
+done
+
 tmux new-session -d -s "$SESSION" -c "$ROOT" \
-    "PYTHONUNBUFFERED=1 uv run python train/train_lora.py --run-name '$RUN_NAME' 2>&1 | tee '$LOG_PATH'"
+    "PYTHONUNBUFFERED=1 uv run python train/train_lora.py --run-name '$RUN_NAME'$EXTRA_STR 2>&1 | tee '$LOG_PATH'"
 
 echo "Started. Attach with:  tmux attach -t $SESSION"
 echo "Follow log with:       tail -f $LOG_PATH"

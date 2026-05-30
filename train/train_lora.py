@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -36,7 +35,6 @@ from unsloth import FastLanguageModel  # noqa: E402
 
 import torch  # noqa: E402
 from datasets import load_dataset  # noqa: E402
-import numpy as np  # noqa: E402
 from transformers import TrainerCallback  # noqa: E402
 from transformers import DataCollatorForLanguageModeling  # noqa: E402
 from trl import SFTTrainer, SFTConfig  # noqa: E402
@@ -46,7 +44,6 @@ HERE = Path(__file__).parent.resolve()
 ROOT = HERE.parent
 DATA_DIR = HERE / "data"
 RUNS_DIR = HERE / "runs"
-EVAL_SCRIPT = ROOT / "eval.py"
 
 
 # ---- Hyperparameters --------------------------------------------------------
@@ -251,15 +248,24 @@ class VramLogCallback(TrainerCallback):
         torch.cuda.reset_peak_memory_stats()
 
 
-# ---- Post-checkpoint eval hook ---------------------------------------------
+# ---- Post-checkpoint sanity-check hook -------------------------------------
 
-class PostCheckpointEvalCallback(TrainerCallback):
-    """After each save, run inference on the held-out 50, save predictions
-    by their canonical example-NNN.json names, then invoke eval.py to
-    produce a report card alongside the checkpoint.
+# Number of eval examples to generate on each save — just enough to eyeball
+# that the model isn't broken (empty output, prompt-regurgitation, repetition
+# loops). NOT a quality eval. Full eval.py against the held-out 50 runs
+# MANUALLY after training, never inline — round 3 wedged for 8+ hours when
+# the old callback ran inference on all 50 at every checkpoint.
+SANITY_N = 3
 
-    ID binding is by the "id" field in each eval.jsonl record — NOT by
-    line order. Robust to dataset reordering.
+
+class SanityCheckCallback(TrainerCallback):
+    """After each save, generate output for exactly SANITY_N eval examples
+    and write them to <checkpoint>/sanity_outputs/. No JSON parsing, no
+    scoring, no eval.py — purely a "is the model producing sane text?"
+    smoke test that costs a few minutes, not hours.
+
+    Example selection is the first SANITY_N records of eval.jsonl in file
+    order — deterministic across checkpoints so outputs are comparable.
     """
 
     def __init__(self, run_dir: Path, eval_jsonl: Path, model, tokenizer):
@@ -272,21 +278,19 @@ class PostCheckpointEvalCallback(TrainerCallback):
         ckpt_dir = Path(args.output_dir) / f"checkpoint-{state.global_step}"
         if not ckpt_dir.exists():
             return
-        out_dir = ckpt_dir / "eval_outputs"
+        out_dir = ckpt_dir / "sanity_outputs"
         out_dir.mkdir(exist_ok=True)
 
-        print(f"\n[eval] running inference on held-out 50 for {ckpt_dir.name}...")
+        print(f"\n[sanity] generating {SANITY_N} samples for {ckpt_dir.name}...")
         FastLanguageModel.for_inference(self.model)
 
         n_done = 0
-        n_parse_ok = 0
         with open(self.eval_jsonl) as f:
             for line in f:
+                if n_done >= SANITY_N:
+                    break
                 rec = json.loads(line)
-                example_id = rec.get("id")
-                if not example_id:
-                    print(f"[eval] WARN: record missing 'id' field; skipping")
-                    continue
+                example_id = rec.get("id") or f"line{n_done}"
 
                 # Drop the assistant turn — model must predict it.
                 prompt_msgs = [m for m in rec["messages"] if m["role"] != "assistant"]
@@ -306,28 +310,11 @@ class PostCheckpointEvalCallback(TrainerCallback):
                     output[0][inputs.input_ids.shape[1]:],
                     skip_special_tokens=True,
                 )
-
-                # Save raw and parsed
                 (out_dir / f"{example_id}.raw.txt").write_text(gen)
-                try:
-                    parsed = json.loads(gen)
-                    (out_dir / f"{example_id}.json").write_text(
-                        json.dumps(parsed, indent=2)
-                    )
-                    n_parse_ok += 1
-                except json.JSONDecodeError:
-                    pass  # eval.py will flag missing files / parse failures
                 n_done += 1
 
         FastLanguageModel.for_training(self.model)
-
-        report_path = self.run_dir / f"eval_{state.global_step}.txt"
-        with open(report_path, "w") as rep:
-            subprocess.run(
-                [sys.executable, str(EVAL_SCRIPT), "--model", str(out_dir)],
-                stdout=rep, stderr=subprocess.STDOUT, check=False,
-            )
-        print(f"[eval] {n_done} predictions ({n_parse_ok} parsed) → {report_path.name}")
+        print(f"[sanity] {n_done} samples → {out_dir.relative_to(self.run_dir.parent)}")
 
 
 # ---- Main -------------------------------------------------------------------
@@ -361,7 +348,16 @@ def main() -> int:
                     help="Subdirectory under train/runs/ (default: timestamp)")
     ap.add_argument("--force", action="store_true",
                     help="Skip GPU-memory preflight check")
+    ap.add_argument("--resume-from-checkpoint", type=str, default=None,
+                    help="Path to a checkpoint dir to resume from, e.g. "
+                         "train/runs/round3-clean/checkpoint-10. Reloads "
+                         "optimizer/scheduler/step state and continues.")
     args = ap.parse_args()
+
+    if args.resume_from_checkpoint and not Path(args.resume_from_checkpoint).exists():
+        print(f"ERROR: resume checkpoint {args.resume_from_checkpoint} not found.",
+              file=sys.stderr)
+        return 1
 
     if not args.train_jsonl.exists():
         print(f"ERROR: {args.train_jsonl} not found. Run format_jsonl.py first.",
@@ -462,10 +458,15 @@ def main() -> int:
     )
 
     trainer.add_callback(VramLogCallback(run_dir))
-    trainer.add_callback(PostCheckpointEvalCallback(run_dir, args.eval_jsonl, model, tokenizer))
+    trainer.add_callback(SanityCheckCallback(run_dir, args.eval_jsonl, model, tokenizer))
 
-    print("Starting training...")
-    trainer.train()
+    # Resume support. NOTE: SFTConfig/TrainingArguments has a
+    # `resume_from_checkpoint` field, but the HF Trainer does NOT read it —
+    # the docs explicitly say it's "not directly used by Trainer." The only
+    # path that actually reloads optimizer/scheduler/trainer state is
+    # passing it to trainer.train(). So we route the CLI flag through here.
+    print(f"Starting training...{' resuming from ' + args.resume_from_checkpoint if args.resume_from_checkpoint else ''}")
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)
 
     # Final save
     final_dir = run_dir / "final"
