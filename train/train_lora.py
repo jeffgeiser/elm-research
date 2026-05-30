@@ -54,7 +54,7 @@ BASE_MODEL = "unsloth/Qwen2.5-7B-Instruct-bnb-4bit"
 # Restored to 16384 for sole-tenant runs (vLLM stopped). Covers p95~12k
 # and max~13.4k token records without truncation. Drop to 8192 if you
 # need to coexist with vLLM or other GPU workloads.
-MAX_SEQ_LENGTH = 16384
+MAX_SEQ_LENGTH = 8192
 
 LORA_RANK = 16
 LORA_ALPHA = 32
