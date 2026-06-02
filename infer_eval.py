@@ -57,6 +57,11 @@ def main() -> int:
                          "training. Round 4 trained at 8192.")
     ap.add_argument("--max-new-tokens", type=int, default=8192,
                     help="Generation budget for the JSON brief.")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="Only generate for the first N eval records — for a "
+                         "quick schema-adherence read before committing to "
+                         "the full set. eval.py will warn about the rest as "
+                         "missing; that's expected on a limited run.")
     args = ap.parse_args()
 
     if not args.adapter.exists():
@@ -85,6 +90,9 @@ def main() -> int:
     n_parse_ok = 0
     with open(args.eval_jsonl) as f:
         for line in f:
+            if args.limit is not None and n_done >= args.limit:
+                print(f"--limit {args.limit} reached; stopping early.")
+                break
             line = line.strip()
             if not line:
                 continue
