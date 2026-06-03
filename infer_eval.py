@@ -165,7 +165,7 @@ def main() -> int:
                   f"{'parsed' if (out_dir / f'{example_id}.json').exists() else 'RAW ONLY (parse failed)'}")
 
     print(f"\nDone: {n_done} predictions, {n_parse_ok} parsed as JSON → {out_dir}")
-    print(f"Now score with:  python eval.py --model {out_dir}")
+    print(f"Now score with:  uv run python eval.py --model {out_dir}")
     return 0
 
 
