@@ -37,6 +37,33 @@ import torch  # noqa: E402
 HERE = Path(__file__).parent.resolve()
 DEFAULT_EVAL_JSONL = HERE / "train" / "data" / "eval.jsonl"
 
+_DECODER = json.JSONDecoder()
+
+
+def extract_first_json(text: str) -> dict | None:
+    """Parse the FIRST complete JSON object in `text`, tolerating leading
+    prose / markdown fences and trailing junk.
+
+    The trained model often appends a second `{"_meta": {...}}` object after
+    the brief — a plain json.loads() then dies with 'Extra data'. raw_decode
+    stops at the end of the first value and ignores whatever follows, which
+    salvages those cases. Returns None if no object can be parsed.
+    """
+    if not text:
+        return None
+    # Drop a leading ```json / ``` fence if present, then seek the first '{'.
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.split("\n", 1)[-1]
+    start = stripped.find("{")
+    if start == -1:
+        return None
+    try:
+        obj, _end = _DECODER.raw_decode(stripped[start:])
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        return None
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -57,6 +84,10 @@ def main() -> int:
                          "training. Round 4 trained at 8192.")
     ap.add_argument("--max-new-tokens", type=int, default=8192,
                     help="Generation budget for the JSON brief.")
+    ap.add_argument("--repetition-penalty", type=float, default=1.15,
+                    help="Penalize token repetition to break greedy "
+                         "degeneration loops (the '0000...' / 'sf_activity...' "
+                         "tails). 1.0 disables; 1.1-1.2 is a safe range.")
     ap.add_argument("--limit", type=int, default=None,
                     help="Only generate for the first N eval records — for a "
                          "quick schema-adherence read before committing to "
@@ -113,6 +144,7 @@ def main() -> int:
                     **inputs,
                     max_new_tokens=args.max_new_tokens,
                     do_sample=False,
+                    repetition_penalty=args.repetition_penalty,
                     pad_token_id=tokenizer.eos_token_id,
                 )
             gen = tokenizer.decode(
@@ -121,14 +153,13 @@ def main() -> int:
             )
 
             (out_dir / f"{example_id}.raw.txt").write_text(gen)
-            try:
-                parsed = json.loads(gen)
+            parsed = extract_first_json(gen)
+            if parsed is not None:
                 (out_dir / f"{example_id}.json").write_text(
                     json.dumps(parsed, indent=2)
                 )
                 n_parse_ok += 1
-            except json.JSONDecodeError:
-                pass  # eval.py will flag the missing .json as a schema miss
+            # else: eval.py will flag the missing .json as a schema miss
             n_done += 1
             print(f"  [{n_done}] {example_id}: "
                   f"{'parsed' if (out_dir / f'{example_id}.json').exists() else 'RAW ONLY (parse failed)'}")
