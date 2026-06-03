@@ -104,9 +104,14 @@ def main() -> int:
 
     out_dir = args.out or (args.adapter.parent / "eval_outputs")
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Clean stale predictions from prior runs — otherwise eval.py scores a
+    # mix of runs (leftover {id}.json files pollute the report).
+    stale = list(out_dir.glob("*.json")) + list(out_dir.glob("*.raw.txt"))
+    for p in stale:
+        p.unlink()
     print(f"Adapter: {args.adapter}")
     print(f"Eval:    {args.eval_jsonl}")
-    print(f"Out:     {out_dir}")
+    print(f"Out:     {out_dir}  (cleared {len(stale)} stale files)")
 
     # Unsloth detects the PEFT adapter_config and loads base + adapter.
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -161,8 +166,11 @@ def main() -> int:
                 n_parse_ok += 1
             # else: eval.py will flag the missing .json as a schema miss
             n_done += 1
-            print(f"  [{n_done}] {example_id}: "
-                  f"{'parsed' if (out_dir / f'{example_id}.json').exists() else 'RAW ONLY (parse failed)'}")
+            ok = parsed is not None
+            # Inline diagnostic: size + tail makes the failure mode (truncation,
+            # repetition loop, trailing junk) visible right in the run log.
+            print(f"  [{n_done}] {example_id}: {len(gen):>6}B "
+                  f"{'✓ parsed' if ok else '✗ FAILED'} | tail: {gen[-90:]!r}")
 
     print(f"\nDone: {n_done} predictions, {n_parse_ok} parsed as JSON → {out_dir}")
     print(f"Now score with:  uv run python eval.py --model {out_dir}")
