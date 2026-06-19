@@ -13,14 +13,30 @@
 
 ## 1. Thesis and goal
 
-**ELMs > LLMs for narrow enterprise tasks.** A small model (7B) fine-tuned on
+**ELMs > LLMs for narrow enterprise tasks.** A small model fine-tuned on
 the right data should beat a frontier general model *prompted at runtime* on a
-narrow, schema-bound synthesis task — faster, cheaper, locally hosted, with
+narrow, schema-bound synthesis task — faster, cheaper, privately hosted, with
 better schema adherence.
 
-**Target product:** `account-intelligence-7b-v1` — a model that synthesizes
+**Target product:** `account-intelligence-v1` — a model that synthesizes
 account data into structured JSON "briefs" across six enterprise surfaces.
-Distilled/quantized to Q4_K_M GGUF for 16GB Apple Silicon deployment.
+
+**Deployment profile (updated 2026-06 — supersedes the original 16GB edge target):**
+- **Private enterprise deployment**, served on **vLLM** (FP8).
+- **~64 GB VRAM** available on the serving host — no longer 16GB-constrained.
+- **Low latency is the priority**; concurrency is low (**2–3 typical, <10**).
+- Because the workload is **long structured outputs (3k–8k JSON tokens) over
+  long inputs (~13k tokens)**, latency is dominated by per-token decode +
+  prefill → driven by **active parameters**, not total size.
+- **Chosen base: `Qwen3-14B-Instruct` (dense)**, thinking-mode **off**. Best
+  accuracy/latency balance for low concurrency; fine-tunes reliably on the
+  small dataset; FP8 (~14GB) leaves large KV headroom in 64GB. See §4/§7.1.
+- **MoE was considered and rejected:** its benefit (quality-per-active-param at
+  concurrency) is moot at 2–3 sessions, and MoE LoRA is less sample-efficient
+  on a ~520-example set + tooling-finicky — likely *costs* trained accuracy
+  here, not gains it.
+- **Qwen3-32B reserved as teacher/judge** (generate + score data), distilled to
+  the 14B that ships.
 
 **The six surfaces** (each has its own expected section set — see the schema):
 `meeting_prep`, `qbr`, `handoff`, `renewal_alert`, `onboarding`, `escalation`.
@@ -36,7 +52,7 @@ Lock the output contract first (a strict JSON Schema). Build a handful of gold
 examples by hand. Use a frontier model (Claude) as a teacher to generate
 synthetic input/output pairs at scale that cover the full distribution of
 account shapes, data-sparsity levels, and edge cases. Freeze a held-out eval
-split. QLoRA-fine-tune a 7B base on the pairs with **completion-only loss**.
+split. QLoRA-fine-tune a small dense base on the pairs with **completion-only loss**.
 Score every checkpoint against locked metrics, with schema adherence as a hard
 gate. Guarantee valid JSON at inference with constrained decoding as a safety
 net. Then quantize for release.
@@ -45,38 +61,49 @@ net. Then quantize for release.
 
 ## 3. Hardware & environment (and its sharp edges)
 
+**Training is moving to a bare-metal server (2026-06).** Rounds 1–4 ran on a
+DGX Spark, whose constraints (below) forced compromises — most notably an 8192
+seq-length cap. The bare-metal target removes those: standard datacenter GPU
+with **working flash attention**, no unified-memory OOM, so we train at **full
+sequence length** (16K+, covering the max ~13.4k-token records) and faster.
+
+### Prior box (DGX Spark) — what it forced, kept here as a cautionary record
 | Component | Value | Notes |
 |---|---|---|
-| Training box | NVIDIA **DGX Spark**, GB10 Grace-Blackwell | **Unified memory** — GPU shares system RAM |
+| Box | NVIDIA **DGX Spark**, GB10 Grace-Blackwell | **Unified memory** — GPU shares system RAM |
 | Memory | **121 GB** unified | `nvidia-smi --query-gpu=memory.*` returns **N/A**; use `free -h` instead |
-| CUDA capability | **12.1** (Blackwell) | Newer than this PyTorch build officially supports (max 12.0) — warns but runs |
-| Torch / CUDA | torch 2.10.0+cu128, CUDA toolkit 12.8 | Installed from the `pytorch-cu128` index (see `pyproject.toml`) |
+| CUDA capability | **12.1** (Blackwell) | Newer than that PyTorch build officially supports (max 12.0) — warns but runs |
+| Torch / CUDA | torch 2.10.0+cu128, CUDA toolkit 12.8 | From the `pytorch-cu128` index (see `pyproject.toml`) |
 | Key libs | unsloth 2026.5.7, transformers 5.5.0, trl 0.24.0, peft, bitsandbytes, accelerate | Pinned in `pyproject.toml` |
 | Package manager | **uv** | Always run via `uv run python …` so the `.venv` is active |
 | Data-gen box | Apple M4 Mac Mini, 16GB | Runs `generate.py` (Claude API), not training |
 
-### Sharp edges that shaped the design
-- **Flash Attention 2 does not work on the GB10** in this build. Unsloth falls
+### Sharp edges that shaped the design (Spark-specific — should NOT recur on bare metal)
+- **Flash Attention 2 did not work on the GB10** in that build. Unsloth fell
   back (`FA [Xformers = None. FA2 = False]`) to **eager / naive O(n²)
-  attention**. This is the single most important performance fact: attention
-  cost is quadratic in sequence length, so long contexts are brutally slow.
-  *Fixing this (a working Blackwell attention kernel) is the real lever for
-  going back to longer sequences.*
-- **Unified memory** means "VRAM" and system RAM are the same pool. A
-  co-resident vLLM server + training run can exceed the pool and hard-crash the
-  box (this happened — "round 4 OOM"). Kill other GPU users before training.
-- **No co-tenancy assumption.** Training assumes sole-tenant use of the GPU.
+  attention** → quadratic attention cost made long contexts brutally slow and
+  drove the 8192 cap. *Note: vLLM served Qwen on the same GB10 fine with
+  `--attention-backend FLASHINFER` — so a working Blackwell kernel exists; the
+  gap was in the Unsloth/training stack.* On bare metal with FA2, train long.
+- **Unified memory** meant "VRAM" and system RAM were one pool; a co-resident
+  vLLM server + training run exceeded it and hard-crashed the box ("round 4
+  OOM"). Standard discrete-GPU VRAM removes this failure mode.
+- **No co-tenancy assumption.** Training assumed sole-tenant use of the GPU.
 
 ---
 
 ## 4. The stack
 
-- **Base model:** `unsloth/Qwen2.5-7B-Instruct-bnb-4bit` (4-bit pre-quantized).
+- **Base model:** **`Qwen3-14B-Instruct`** (dense), thinking-mode off — chosen
+  per the §1 deployment profile. *Rounds 1–4 used
+  `unsloth/Qwen2.5-7B-Instruct-bnb-4bit`; see §13 for the migration.*
 - **Method:** QLoRA (4-bit frozen base + trainable LoRA adapters) via **Unsloth**
-  `FastLanguageModel` for the patched kernels + memory savings.
+  `FastLanguageModel` for the patched kernels + memory savings. (With more VRAM
+  on bare metal, full bf16 LoRA or a higher-rank adapter is also on the table.)
 - **Trainer:** TRL **`SFTTrainer`** with **`SFTConfig`** (not bare
   `TrainingArguments` — see the gotcha in §7).
-- **Chat template:** Qwen2.5 ChatML (`<|im_start|>role\n…<|im_end|>`).
+- **Chat template:** Qwen3 ChatML (`<|im_start|>role\n…<|im_end|>`). Same
+  family as Qwen2.5, but **re-verify the collator token IDs** (§13).
 
 ---
 
@@ -161,9 +188,12 @@ Run via `train/run.sh <run-name> [extra args…]` (wraps it in tmux + a log file
 so it survives SSH drops; forwards extra args to the script).
 
 ### 7.1 Hyperparameters (locked in-file, versioned with the run)
+> Values below are the **round 1–4 (Qwen2.5-7B / DGX Spark)** settings. For the
+> Qwen3-14B bare-metal profile, the ones that change are flagged inline; the
+> rest are reasonable starting points. Re-tune after the first 14B run.
 ```
-BASE_MODEL        = unsloth/Qwen2.5-7B-Instruct-bnb-4bit
-MAX_SEQ_LENGTH    = 8192          # see §7.4 — was 16384
+BASE_MODEL        = Qwen/Qwen3-14B          # CHANGED (was unsloth/Qwen2.5-7B-Instruct-bnb-4bit)
+MAX_SEQ_LENGTH    = 16384                   # CHANGED — full coverage on bare metal w/ FA2 (was 8192 on Spark)
 LORA_RANK         = 16
 LORA_ALPHA        = 32
 LORA_DROPOUT      = 0.0           # Unsloth-recommended for speed
@@ -186,11 +216,13 @@ this, the model learns to regurgitate the (huge) system prompt and collapses
 into repetition (observed in round 1).
 
 Implementation detail that matters: the collator masks the prefix using
-**Qwen2.5 special token IDs directly** (`<|im_start|>` id + the BPE pieces of
+**Qwen special token IDs directly** (`<|im_start|>` id + the BPE pieces of
 `"assistant"` + the following newline), **not** by string-matching a rendered
 template. Rationale: the BPE tokenization of a standalone template string can
 differ from how those tokens appear mid-sequence after `apply_chat_template`,
-which silently broke masking before.
+which silently broke masking before. **On the Qwen2.5→Qwen3 move, re-verify
+these IDs** — the collator's init self-test will fail loudly if they drifted
+(see §13).
 
 The collator **self-tests on init** against a synthetic chat sequence and
 **refuses to construct** if masking would mask everything or nothing — this is
@@ -206,16 +238,19 @@ is `"text"` (we pre-apply the chat template into a `text` column because
 auto-detection from `messages` is unreliable across TRL/Unsloth versions);
 `packing=False`.
 
-### 7.4 Sequence length = 8192 (a deliberate trade-off)
-The dataset has records up to ~13.4K tokens (p95 ~12K). Ideally seq_len would
-cover that (16384). **But** with no working flash attention on the GB10 (§3),
-16384 makes attention quadratically slow — eval inference became unusable and
-training crawled. We run at **8192**, accepting that the longest records are
-**truncated**. Because this is completion-only training with the JSON answer at
-the end, truncation can cut off part of the target for the longest accounts —
-a real quality cost on those examples. **The correct long-term fix is a working
-Blackwell attention kernel, not more memory** (there's plenty: 11.6GB used of
-121GB at 8192/batch-1).
+### 7.4 Sequence length — 16384 on bare metal (was 8192 on the Spark)
+The dataset has records up to ~13.4K tokens (p95 ~12K), so seq_len must reach
+**16384** to avoid truncating the longest targets. On the DGX Spark this was
+**impossible in practice**: with no working flash attention (§3), 16384 made
+attention quadratically slow, so rounds 1–4 ran at **8192** and *truncated* the
+longest records — and because this is completion-only training with the JSON at
+the *end*, that cut off part of the target for the biggest accounts (a real
+quality cost we knowingly accepted).
+
+**On bare metal with FA2 this compromise goes away — train at 16384.** Qwen3's
+native context (32K, 128K w/ YaRN) covers it comfortably, and FA2 keeps
+attention tractable. Re-check VRAM at 14B + 16384: gradient checkpointing on,
+start `PER_DEVICE_BATCH=1`/`GRAD_ACCUM=16`, raise batch if headroom allows.
 
 ### 7.5 Callbacks
 - **`VramLogCallback`** — logs peak alloc/reserved/free every N steps to
@@ -240,7 +275,9 @@ passed to `train()`. The checkpoint dir must contain optimizer/scheduler/
 `preflight_gpu_check` refuses to start unless ≥60GB is free (via
 `torch.cuda.mem_get_info`, which *does* work on unified memory even though the
 nvidia-smi CSV query returns N/A). `--force` overrides — don't, it's what the
-OOM crash was about.
+OOM crash was about. **The 60GB threshold was sized for the Spark's 121GB
+unified pool with a co-resident vLLM risk; retune it for the bare-metal GPU**
+(on a dedicated training box the contention that motivated it shouldn't exist).
 
 ---
 
@@ -303,7 +340,9 @@ field in the *wrong* section (observed: `open_in_meeting`/`watch_for` leaking
 from `must_address` items into `pipeline` items). Constrained decoding
 (Outlines) is the planned structural fix; more training may reduce it.
 
-### 9.3 Truncation at 8192 (see §7.4) and the Blackwell attention kernel.
+### 9.3 Truncation at 8192 — RESOLVED by the bare-metal move (see §7.4)
+Was a Spark-only constraint (broken FA2 → eager attention). On bare metal with
+FA2 we train at 16384 and stop truncating. Closed once the first 14B run lands.
 
 ### 9.4 Output length / termination
 Long surfaces (escalation, meeting_prep) produce very large briefs that can hit
@@ -327,9 +366,10 @@ schema-constrained decoder would help more.
 ## 11. End-to-end runbook
 
 ```bash
-# 0. Environment (DGX Spark, sole-tenant GPU)
-pkill -9 -f vllm                 # free the unified-memory pool
-free -h                          # confirm ~60GB+ available ("VRAM" == RAM here)
+# 0. Environment — bare-metal (dedicated GPU): just confirm VRAM is free
+nvidia-smi --query-gpu=memory.free --format=csv
+#   (Spark-era only: pkill -9 -f vllm + free -h, because vLLM shared the
+#    unified-memory pool. Not needed on a dedicated training box.)
 
 # 1. (If data changed) regenerate training records
 uv run python train/format_jsonl.py        # → train/data/{train,eval}.jsonl
@@ -354,10 +394,45 @@ uv run python eval.py --model train/runs/round5/eval_outputs
 
 ## 12. Roadmap context
 
-- [ ] Resolve §9.1 (Path A vs B) — **gating decision**
+- [ ] Resolve §9.1 (Path A vs B) — **gating decision; biggest accuracy lever**
 - [ ] Outlines constrained decoding + retry middleware (schema-valid output guarantee)
-- [ ] Fine-tune Qwen2.5-32B teacher → distill to 7B
-- [ ] Quantize to Q4_K_M GGUF; validate on 16GB Apple Silicon
-- [ ] Release `account-intelligence-7b-v1` on Hugging Face
-- [ ] (Infra) working flash-attention kernel for GB10/Blackwell → unlock 16384 seq_len
+- [ ] Stand up bare-metal training; migrate base to **Qwen3-14B** (see §13)
+- [ ] Fine-tune **Qwen3-32B teacher → distill to Qwen3-14B** (the deploy model)
+- [ ] Serve on **vLLM at FP8** for private enterprise deployment (~64GB VRAM, low concurrency)
+- [ ] Release `account-intelligence-v1` (internal/private; HF optional)
+
+### Accuracy levers, in priority order (don't over-invest in model size)
+1. **§9.1 input framing (Path B)** — the model currently learns the wrong task. Biggest gain.
+2. **Outlines constrained decoding** — eliminates the structural failures (field placement, enums, trailing `_meta`).
+3. **More/cleaner data** — ~520 examples is thin.
+4. **Base upgrade (Qwen2.5-7B → Qwen3-14B)** — real but smallest marginal gain.
+
+---
+
+## 13. Migration: Qwen2.5-7B → Qwen3-14B (bare metal)
+
+Touchpoints when switching the base model (do these in order; the first run is a
+shakedown, not a quality run):
+
+1. **`BASE_MODEL`** in `train/train_lora.py` → `Qwen/Qwen3-14B` (or an Unsloth
+   4-bit build if staying on QLoRA). With more VRAM, consider full bf16 LoRA.
+2. **`MAX_SEQ_LENGTH`** → `16384` (§7.4). Confirm FA2 is actually active in the
+   training stack (the Spark's whole problem was that it wasn't).
+3. **Thinking mode OFF.** Qwen3 ships dual-mode reasoning. For structured JSON
+   you must disable it (e.g. `enable_thinking=False` in the chat-template call /
+   the `/no_think` convention), or the model wraps output in `<think>…</think>`
+   and breaks parsing. Verify the rendered `text` column has **no** think block.
+4. **`CompletionOnlyCollator` token IDs (§7.2).** Qwen3 is ChatML like Qwen2.5,
+   but re-verify `<|im_start|>` id + the BPE pieces of `"assistant"` + newline.
+   The collator's init self-test fails loudly if they drifted — trust it.
+5. **Re-tune hyperparameters** for 14B: LR may want to drop (larger model),
+   re-check warmup vs. total steps if the dataset grows. Treat §7.1 values as
+   starting points, not gospel.
+6. **`infer_eval.py` / serving:** generation can run via vLLM (FP8) now rather
+   than Unsloth in-process; keep `--repetition-penalty` tunable and the
+   `raw_decode` salvage. Pair inference with **Outlines** for schema validity.
+7. **Update `pyproject.toml`** for the bare-metal CUDA/driver (the `cu128`
+   pin + `pytorch-cu128` index were Spark-specific).
+8. **Sanity first.** Run a tiny shakedown (few steps, `--limit` eval) to confirm
+   collator masking, thinking-off, and seq length before a full run.
 ```
