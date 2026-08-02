@@ -54,8 +54,10 @@ DATASET_DIR = HERE / "datasets" / "account-intelligence"
 DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
 DEFAULT_BASE_URL = "https://gateway.theturbo.ai/v1"
 DEFAULT_MAX_TOKENS = 16000
+DEFAULT_MAX_TOKENS_PATH_B = 24000  # source_bundle + brief is ~2x a brief alone
 DEFAULT_TEMP = 0.6
 DEFAULT_RETRIES = 5
+DEFAULT_RETRIES_PATH_B = 8  # more iterations to converge complex dual output
 DEFAULT_COST_CAP_USD = 20.0
 
 # Sonnet pricing — used only for the up-front cost estimate, not billing.
@@ -236,19 +238,27 @@ def extract_json_block(text: str) -> str | None:
 # ----- one-example generation ---------------------------------------------
 
 
+_PATH_B_STRUCTURE_REMINDER = """\
+Your output must be a single JSON object with this top-level structure:
+{
+  "_meta": { "account": "...", "synthetic": true, "surface": "...", "shape_constraints": "...", "edge_cases_included": [...] },
+  "source_bundle": { "surface": "...", "pulled_at": "...", "sf_account": {...}, "sf_opportunities": [...], ... },
+  "brief": { "account": {...}, "surface": "...", "generated_at": "...", "executive_summary": "...", ... }
+}
+The brief schema is strict — use ONLY defined field names. Keep the source_bundle intact."""
+
+
 def _validate_doc(doc: dict, validator: Draft202012Validator, mode: str) -> list:
     """Return schema errors. In path-b mode validate doc['brief']; in path-a
     validate the top-level doc (which IS the brief)."""
     if mode == "path-b":
-        if "brief" not in doc:
+        if "brief" not in doc or "source_bundle" not in doc:
             class _FakeError:
                 absolute_path = []
-                message = "missing 'brief' key in path-b output"
-            return [_FakeError()]
-        if "source_bundle" not in doc:
-            class _FakeError:
-                absolute_path = []
-                message = "missing 'source_bundle' key in path-b output"
+                message = (
+                    "Output is missing required wrapper keys. "
+                    + _PATH_B_STRUCTURE_REMINDER
+                )
             return [_FakeError()]
         return list(validator.iter_errors(doc["brief"]))
     return list(validator.iter_errors(doc))
@@ -345,15 +355,22 @@ def generate_one(
                 for e in errors[:15]
             )
         )
-        brief_key = "brief" if mode == "path-b" else "the brief"
+        if mode == "path-b":
+            structure_hint = (
+                "\n\nRemember: output must be "
+                "`{\"_meta\": {...}, \"source_bundle\": {...}, \"brief\": {...}}`. "
+                "Fix only the `brief` schema errors; keep source_bundle unchanged."
+            )
+        else:
+            structure_hint = ""
         messages += [
             {"role": "assistant", "content": text},
             {"role": "user", "content": (
-                f"The {brief_key} had {len(errors)} schema validation "
-                f"errors:\n\n{err_summary}\n\n"
-                "Fix only the schema errors — keep source_bundle and all "
-                "brief content the same. The schema is strict: use ONLY "
-                "defined fields and exact enum values."
+                f"Schema validation found {len(errors)} error(s) in the brief:"
+                f"\n\n{err_summary}"
+                f"\n\nFix these errors only — use ONLY defined field names "
+                f"and exact enum values. Brief content stays the same."
+                f"{structure_hint}"
             )},
         ]
 
@@ -529,7 +546,16 @@ def main() -> int:
         return 2
 
     base_url = args.base_url or os.environ.get("GATEWAY_BASE_URL") or DEFAULT_BASE_URL
-    print(f"Gateway: {base_url}  Model: {args.model}")
+    # Apply mode-appropriate defaults if the user didn't override them explicitly.
+    max_tokens = args.max_tokens
+    retries = args.retries
+    if args.mode == "path-b":
+        if max_tokens == DEFAULT_MAX_TOKENS:   # user didn't override
+            max_tokens = DEFAULT_MAX_TOKENS_PATH_B
+        if retries == DEFAULT_RETRIES:         # user didn't override
+            retries = DEFAULT_RETRIES_PATH_B
+
+    print(f"Gateway: {base_url}  Model: {args.model}  max_tokens: {max_tokens}  retries: {retries}")
     client = OpenAI(api_key=api_key, base_url=base_url)
     dataset_dir = Path(args.dataset_dir).expanduser().resolve()
     dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -550,9 +576,9 @@ def main() -> int:
             validator=validator,
             params=params,
             model=args.model,
-            max_tokens=args.max_tokens,
+            max_tokens=max_tokens,
             temperature=args.temperature,
-            retries=args.retries,
+            retries=retries,
             mode=args.mode,
         )
         if result.doc is None:
