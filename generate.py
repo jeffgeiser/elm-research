@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Synthetic example generator for the account intelligence model dataset.
 
-Walks a generation matrix (one row per example), calls Claude with the
+Walks a generation matrix (one row per example), calls the model with the
 system prompt + per-row user prompt, validates each output against
 schema.json, retries with validation errors fed back on failure. Writes
 successful examples to dataset/example-NNN.json (gitignored).
@@ -13,7 +13,13 @@ Usage:
     python generate.py --dry-run --surface qbr --count 5
 
 Env:
-    ANTHROPIC_API_KEY   required (not used in --dry-run).
+    GATEWAY_API_KEY     API key for the gateway (preferred).
+    GATEWAY_BASE_URL    Base URL for the gateway (default: https://gateway.theturbo.ai/v1).
+    ANTHROPIC_API_KEY   Fallback if GATEWAY_API_KEY is not set (uses Anthropic SDK directly).
+
+The generator uses the OpenAI-compatible /v1/chat/completions interface so it
+works with any gateway or provider that speaks that format (Anthropic, OpenAI,
+Qwen, etc.). Pass --model to select the model; default is claude-sonnet-4-5-20250929.
 """
 from __future__ import annotations
 
@@ -29,7 +35,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
-from anthropic import Anthropic
+from openai import OpenAI
 from jsonschema import Draft202012Validator
 
 
@@ -44,14 +50,14 @@ DATASET_DIR = HERE / "datasets" / "account-intelligence"
 
 # ----- defaults -----------------------------------------------------------
 
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
+DEFAULT_BASE_URL = "https://gateway.theturbo.ai/v1"
 DEFAULT_MAX_TOKENS = 16000
 DEFAULT_TEMP = 0.6
 DEFAULT_RETRIES = 5
 DEFAULT_COST_CAP_USD = 20.0
 
-# Sonnet 4.6 pricing as of 2026-05 — update if the price changes. Used
-# for the up-front cost estimate, not for billing.
+# Sonnet pricing — used only for the up-front cost estimate, not billing.
 COST_INPUT_PER_M_USD = 3.0
 COST_OUTPUT_PER_M_USD = 15.0
 # Rough average per example based on dry-runs. Input includes the full
@@ -231,7 +237,7 @@ def extract_json_block(text: str) -> str | None:
 
 def generate_one(
     *,
-    client: Anthropic,
+    client: OpenAI,
     system_prompt: str,
     validator: Draft202012Validator,
     params: GenParams,
@@ -240,8 +246,8 @@ def generate_one(
     temperature: float,
     retries: int,
 ) -> GenResult:
-    """Call Claude with retry-on-validation-failure. Feeds the specific
-    schema errors back into the conversation as a corrective user turn.
+    """Call the model via OpenAI-compatible API with retry-on-validation-failure.
+    Feeds schema errors back into the conversation as a corrective user turn.
 
     Returns a GenResult with `doc` populated on success or `None` on
     failure-after-retries; the errors_log captures each attempt's
@@ -249,7 +255,8 @@ def generate_one(
     failed runs.
     """
     messages: list[dict] = [
-        {"role": "user", "content": params.format_user_prompt()}
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": params.format_user_prompt()},
     ]
     result = GenResult(doc=None, attempts=0)
     t0 = time.time()
@@ -257,18 +264,17 @@ def generate_one(
     for attempt in range(retries):
         result.attempts = attempt + 1
         try:
-            resp = client.messages.create(
+            resp = client.chat.completions.create(
                 model=model,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                system=system_prompt,
                 messages=messages,
             )
         except Exception as exc:  # noqa: BLE001
             result.errors_log.append(f"attempt {attempt + 1}: API call failed: {exc}")
             break
 
-        text = resp.content[0].text if resp.content else ""
+        text = resp.choices[0].message.content if resp.choices else ""
         result.last_raw_text = text
 
         body = extract_json_block(text)
@@ -276,19 +282,14 @@ def generate_one(
             result.errors_log.append(
                 f"attempt {attempt + 1}: no JSON block in response"
             )
-            messages.extend(
-                [
-                    {"role": "assistant", "content": text},
-                    {
-                        "role": "user",
-                        "content": (
-                            "Your output didn't contain a ```json``` code block. "
-                            "Emit ONLY the brief wrapped in a single fenced "
-                            "json code block — no prose before or after."
-                        ),
-                    },
-                ]
-            )
+            messages += [
+                {"role": "assistant", "content": text},
+                {"role": "user", "content": (
+                    "Your output didn't contain a ```json``` code block. "
+                    "Emit ONLY the brief wrapped in a single fenced "
+                    "json code block — no prose before or after."
+                )},
+            ]
             continue
 
         try:
@@ -297,18 +298,13 @@ def generate_one(
             result.errors_log.append(
                 f"attempt {attempt + 1}: JSON parse error: {exc}"
             )
-            messages.extend(
-                [
-                    {"role": "assistant", "content": text},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Your JSON failed to parse: {exc}. "
-                            "Regenerate with valid JSON syntax."
-                        ),
-                    },
-                ]
-            )
+            messages += [
+                {"role": "assistant", "content": text},
+                {"role": "user", "content": (
+                    f"Your JSON failed to parse: {exc}. "
+                    "Regenerate with valid JSON syntax."
+                )},
+            ]
             continue
 
         errors = list(validator.iter_errors(doc))
@@ -324,24 +320,22 @@ def generate_one(
         )
         result.errors_log.append(
             f"attempt {attempt + 1}: {len(errors)} schema errors\n"
-            + "\n".join(f"  - at {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}" for e in errors[:15])
+            + "\n".join(
+                f"  - at {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}"
+                for e in errors[:15]
+            )
         )
-        messages.extend(
-            [
-                {"role": "assistant", "content": text},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Your previous output had {len(errors)} schema "
-                        f"validation errors:\n\n{err_summary}\n\n"
-                        "Emit the brief again with these fixed. The schema "
-                        "is strict: use ONLY fields it defines, and match "
-                        "exact enum values. The brief content stays the "
-                        "same — just the structure changes."
-                    ),
-                },
-            ]
-        )
+        messages += [
+            {"role": "assistant", "content": text},
+            {"role": "user", "content": (
+                f"Your previous output had {len(errors)} schema "
+                f"validation errors:\n\n{err_summary}\n\n"
+                "Emit the brief again with these fixed. The schema "
+                "is strict: use ONLY fields it defines, and match "
+                "exact enum values. The brief content stays the "
+                "same — just the structure changes."
+            )},
+        ]
 
     result.elapsed_s = time.time() - t0
     return result
@@ -402,7 +396,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="First example ID (default: max existing + 1).",
     )
-    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--model", default=DEFAULT_MODEL,
+                   help=f"Model ID to use (default: {DEFAULT_MODEL}).")
+    p.add_argument("--base-url", default=None,
+                   help=f"API base URL (default: $GATEWAY_BASE_URL or {DEFAULT_BASE_URL}). "
+                        "Use https://api.anthropic.com/v1 for direct Anthropic access.")
     p.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     p.add_argument("--temperature", type=float, default=DEFAULT_TEMP)
     p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
@@ -493,14 +491,20 @@ def main() -> int:
         print("\n--dry-run set; not calling API.")
         return 0
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    api_key = (
+        os.environ.get("GATEWAY_API_KEY")
+        or os.environ.get("ANTHROPIC_API_KEY")
+    )
+    if not api_key:
         print(
-            "ERROR: ANTHROPIC_API_KEY not set in environment.",
+            "ERROR: set GATEWAY_API_KEY (or ANTHROPIC_API_KEY) in environment or .env.",
             file=sys.stderr,
         )
         return 2
 
-    client = Anthropic()
+    base_url = args.base_url or os.environ.get("GATEWAY_BASE_URL") or DEFAULT_BASE_URL
+    print(f"Gateway: {base_url}  Model: {args.model}")
+    client = OpenAI(api_key=api_key, base_url=base_url)
     dataset_dir = Path(args.dataset_dir).expanduser().resolve()
     dataset_dir.mkdir(parents=True, exist_ok=True)
     next_id = next_example_id(dataset_dir, args.start_id)
