@@ -2,16 +2,18 @@
 """Format the gold dataset as chat-format JSONL for SFT.
 
 IMPORTANT — what this trains:
-    The gold examples are (constraints → brief) pairs from the synthetic
-    pipeline. The user prompt is the slot-filled generation template
-    (surface + account_shape + edge_cases + source_mix), the assistant
-    response is the brief JSON. This trains a SYNTHESIS model: given
-    constraints, fabricate a plausible brief.
 
-    To train a SUMMARIZATION model (real SF data → brief), Phase 3
-    needs to reconstruct input packs (SF rows, opps, contacts, cases,
-    activities, Teams messages, news) for each example, then re-pair
-    those inputs with the brief. This script does not do that.
+    PATH B (default, new): examples contain a `source_bundle` key alongside
+    the `brief`. The formatter pairs (source_bundle → brief) using the short
+    inference system prompt. This trains a SUMMARIZATION model: given real-
+    looking source data (CRM rows, activities, cases, Teams messages, news),
+    synthesize the brief. This is the correct production task.
+
+    PATH A (legacy): examples contain only the brief + a `_meta` knob block.
+    The formatter reconstructs the generation prompt from `_meta` and pairs
+    (generation knobs → brief). This trains a SYNTHESIS model that clones
+    the data generator — NOT useful for production inference on live accounts.
+    Kept for backward compatibility with the ~572 round 1-4 examples.
 
 Splits:
     - Holds out the 50 IDs in datasets/account-intelligence/eval_split.txt
@@ -50,6 +52,7 @@ from pathlib import Path
 HERE = Path(__file__).parent.resolve()
 ROOT = HERE.parent
 SYSTEM_PROMPT_PATH = ROOT / "prompts" / "account-intelligence" / "system-prompt.md"
+INFERENCE_SYSTEM_PROMPT_PATH = ROOT / "prompts" / "account-intelligence" / "inference-system-prompt.md"
 DATA_DIR = ROOT / "datasets" / "account-intelligence"
 EVAL_SPLIT_PATH = DATA_DIR / "eval_split.txt"
 
@@ -179,6 +182,7 @@ def load_eval_ids() -> set[str]:
 
 
 def build_record(example_id: str, doc: dict, system_prompt: str) -> dict:
+    """Path A: (generation knobs → brief). Legacy format."""
     meta = doc.get("_meta", {})
     surface = doc.get("surface") or meta.get("surface")
     user_prompt = reconstruct_user_prompt(meta, surface)
@@ -194,6 +198,49 @@ def build_record(example_id: str, doc: dict, system_prompt: str) -> dict:
     }
 
 
+def format_source_bundle(bundle: dict) -> str:
+    """Render the source bundle as a readable user message.
+
+    Keeps JSON structure but adds section headers so the model can navigate
+    the input. Closer to what a real production retrieval pipeline emits.
+    """
+    surface = bundle.get("surface", "unknown")
+    pulled_at = bundle.get("pulled_at", "")
+    lines = [
+        f"## Account Intelligence Request",
+        f"Surface: {surface}",
+        f"Data pulled at: {pulled_at}",
+        "",
+        "## Source Data",
+        "```json",
+        json.dumps(bundle, indent=2, ensure_ascii=False),
+        "```",
+    ]
+    return "\n".join(lines)
+
+
+def build_record_path_b(example_id: str, doc: dict, inference_system_prompt: str) -> dict:
+    """Path B: (source_bundle → brief). The correct production task.
+
+    The model sees the inference system prompt (concise, task-focused) and
+    the source bundle formatted as a user message, and must produce the brief.
+    This is exactly what the fine-tuned model will do at serving time with
+    real SF/Teams/news data.
+    """
+    source_bundle = doc["source_bundle"]
+    brief = doc["brief"]
+    # Strip any _meta leakage from the brief output
+    brief_clean = {k: v for k, v in brief.items() if k != "_meta"}
+    return {
+        "id": example_id,
+        "messages": [
+            {"role": "system", "content": inference_system_prompt},
+            {"role": "user", "content": format_source_bundle(source_bundle)},
+            {"role": "assistant", "content": json.dumps(brief_clean, ensure_ascii=False)},
+        ],
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", type=Path, default=HERE / "data",
@@ -204,28 +251,37 @@ def main() -> int:
     train_path = args.out / "train.jsonl"
     eval_path = args.out / "eval.jsonl"
 
-    system_prompt = SYSTEM_PROMPT_PATH.read_text()
+    system_prompt_path_a = SYSTEM_PROMPT_PATH.read_text()
+    inference_system_prompt = INFERENCE_SYSTEM_PROMPT_PATH.read_text()
     eval_ids = load_eval_ids()
 
     files = sorted(DATA_DIR.glob("example-*.json"))
-    print(f"Loaded {len(files)} gold examples")
+    print(f"Loaded {len(files)} examples from {DATA_DIR}")
     print(f"Eval split: {len(eval_ids)} held-out IDs")
 
     train_count = 0
     eval_count = 0
+    path_a_count = 0
+    path_b_count = 0
     by_surface_train: dict[str, int] = defaultdict(int)
     coverage_warnings: list[str] = []
 
     with open(train_path, "w") as ftrain, open(eval_path, "w") as feval:
         for f in files:
             doc = json.loads(f.read_text())
-            rec = build_record(f.stem, doc, system_prompt)
-            surface = doc.get("surface") or doc.get("_meta", {}).get("surface")
 
-            # Sanity-check: did slot reconstruction find a shape?
-            meta = doc.get("_meta", {})
-            if extract_shape(meta) is None:
-                coverage_warnings.append(f"{f.stem}: no canonical shape extracted from _meta")
+            # Auto-detect mode: Path B examples have a 'source_bundle' key.
+            if "source_bundle" in doc:
+                rec = build_record_path_b(f.stem, doc, inference_system_prompt)
+                surface = (doc.get("brief") or {}).get("surface") or doc.get("_meta", {}).get("surface")
+                path_b_count += 1
+            else:
+                rec = build_record(f.stem, doc, system_prompt_path_a)
+                surface = doc.get("surface") or doc.get("_meta", {}).get("surface")
+                meta = doc.get("_meta", {})
+                if extract_shape(meta) is None:
+                    coverage_warnings.append(f"{f.stem}: no canonical shape in _meta (path-a)")
+                path_a_count += 1
 
             line = json.dumps(rec, ensure_ascii=False) + "\n"
             if f.stem in eval_ids:
@@ -238,6 +294,10 @@ def main() -> int:
 
     print(f"\nWrote {train_path} ({train_count} examples)")
     print(f"Wrote {eval_path} ({eval_count} examples)")
+    print(f"\nMode breakdown: {path_b_count} path-b (source_bundle→brief), {path_a_count} path-a (legacy knobs→brief)")
+    if path_a_count > 0:
+        print(f"  NOTE: {path_a_count} path-a examples included. These train the model on generation knobs,")
+        print(f"  not real source data. Consider excluding them once path-b data is sufficient.")
     print("\nTrain split by surface:")
     for s, n in sorted(by_surface_train.items()):
         print(f"  {s}: {n}")

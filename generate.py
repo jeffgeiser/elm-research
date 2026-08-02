@@ -44,6 +44,7 @@ from jsonschema import Draft202012Validator
 HERE = Path(__file__).parent.resolve()
 ROOT = HERE
 SYSTEM_PROMPT_PATH = HERE / "prompts" / "account-intelligence" / "system-prompt.md"
+SYSTEM_PROMPT_PATH_B = HERE / "prompts" / "account-intelligence" / "system-prompt-path-b.md"
 SCHEMA_PATH = HERE / "schemas" / "account-intelligence" / "schema.json"
 DATASET_DIR = HERE / "datasets" / "account-intelligence"
 
@@ -235,6 +236,24 @@ def extract_json_block(text: str) -> str | None:
 # ----- one-example generation ---------------------------------------------
 
 
+def _validate_doc(doc: dict, validator: Draft202012Validator, mode: str) -> list:
+    """Return schema errors. In path-b mode validate doc['brief']; in path-a
+    validate the top-level doc (which IS the brief)."""
+    if mode == "path-b":
+        if "brief" not in doc:
+            class _FakeError:
+                absolute_path = []
+                message = "missing 'brief' key in path-b output"
+            return [_FakeError()]
+        if "source_bundle" not in doc:
+            class _FakeError:
+                absolute_path = []
+                message = "missing 'source_bundle' key in path-b output"
+            return [_FakeError()]
+        return list(validator.iter_errors(doc["brief"]))
+    return list(validator.iter_errors(doc))
+
+
 def generate_one(
     *,
     client: OpenAI,
@@ -245,6 +264,7 @@ def generate_one(
     max_tokens: int,
     temperature: float,
     retries: int,
+    mode: str = "path-b",
 ) -> GenResult:
     """Call the model via OpenAI-compatible API with retry-on-validation-failure.
     Feeds schema errors back into the conversation as a corrective user turn.
@@ -307,7 +327,7 @@ def generate_one(
             ]
             continue
 
-        errors = list(validator.iter_errors(doc))
+        errors = _validate_doc(doc, validator, mode)
         if not errors:
             result.doc = doc
             result.elapsed_s = time.time() - t0
@@ -325,15 +345,15 @@ def generate_one(
                 for e in errors[:15]
             )
         )
+        brief_key = "brief" if mode == "path-b" else "the brief"
         messages += [
             {"role": "assistant", "content": text},
             {"role": "user", "content": (
-                f"Your previous output had {len(errors)} schema "
-                f"validation errors:\n\n{err_summary}\n\n"
-                "Emit the brief again with these fixed. The schema "
-                "is strict: use ONLY fields it defines, and match "
-                "exact enum values. The brief content stays the "
-                "same — just the structure changes."
+                f"The {brief_key} had {len(errors)} schema validation "
+                f"errors:\n\n{err_summary}\n\n"
+                "Fix only the schema errors — keep source_bundle and all "
+                "brief content the same. The schema is strict: use ONLY "
+                "defined fields and exact enum values."
             )},
         ]
 
@@ -396,6 +416,10 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="First example ID (default: max existing + 1).",
     )
+    p.add_argument("--mode", choices=["path-a", "path-b"], default="path-b",
+                   help="path-b (default): emit source_bundle + brief — the correct "
+                        "training signal for a real inference model. "
+                        "path-a: legacy knob-only generation (brief only, no source data).")
     p.add_argument("--model", default=DEFAULT_MODEL,
                    help=f"Model ID to use (default: {DEFAULT_MODEL}).")
     p.add_argument("--base-url", default=None,
@@ -442,16 +466,18 @@ def estimate_cost_usd(count: int) -> float:
 def main() -> int:
     args = parse_args()
 
-    if not SYSTEM_PROMPT_PATH.exists():
-        print(f"ERROR: system prompt not found at {SYSTEM_PROMPT_PATH}", file=sys.stderr)
+    prompt_path = SYSTEM_PROMPT_PATH_B if args.mode == "path-b" else SYSTEM_PROMPT_PATH
+    if not prompt_path.exists():
+        print(f"ERROR: system prompt not found at {prompt_path}", file=sys.stderr)
         return 2
     if not SCHEMA_PATH.exists():
         print(f"ERROR: schema not found at {SCHEMA_PATH}", file=sys.stderr)
         return 2
 
-    system_prompt = SYSTEM_PROMPT_PATH.read_text()
+    system_prompt = prompt_path.read_text()
     schema = json.loads(SCHEMA_PATH.read_text())
     validator = Draft202012Validator(schema)
+    print(f"Mode: {args.mode}")
 
     edge_cases = (
         [s.strip() for s in args.edge_cases.split(",") if s.strip()]
@@ -527,6 +553,7 @@ def main() -> int:
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             retries=args.retries,
+            mode=args.mode,
         )
         if result.doc is None:
             print(
