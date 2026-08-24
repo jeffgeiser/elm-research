@@ -44,7 +44,8 @@ from jsonschema import Draft202012Validator
 HERE = Path(__file__).parent.resolve()
 ROOT = HERE
 SYSTEM_PROMPT_PATH = HERE / "prompts" / "account-intelligence" / "system-prompt.md"
-SYSTEM_PROMPT_PATH_B = HERE / "prompts" / "account-intelligence" / "system-prompt-path-b.md"
+SOURCE_BUNDLE_PROMPT_PATH = HERE / "prompts" / "account-intelligence" / "source-bundle-generator.md"
+INFERENCE_PROMPT_PATH = HERE / "prompts" / "account-intelligence" / "inference-system-prompt.md"
 SCHEMA_PATH = HERE / "schemas" / "account-intelligence" / "schema.json"
 DATASET_DIR = HERE / "datasets" / "account-intelligence"
 
@@ -378,6 +379,169 @@ def generate_one(
     return result
 
 
+# ----- Path B: two-call generation ----------------------------------------
+
+
+def generate_source_bundle(
+    *,
+    client: OpenAI,
+    source_bundle_prompt: str,
+    params: GenParams,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+) -> dict | None:
+    """Call 1 of 2 for path-b: generate a realistic source bundle from params.
+    No schema validation — just parse the JSON. Returns None on failure."""
+    messages = [
+        {"role": "system", "content": source_bundle_prompt},
+        {"role": "user", "content": params.format_user_prompt()},
+    ]
+    try:
+        resp = client.chat.completions.create(
+            model=model, max_tokens=max_tokens,
+            temperature=temperature, messages=messages,
+        )
+    except Exception as exc:
+        print(f"    [bundle] API error: {exc}")
+        return None
+    text = resp.choices[0].message.content if resp.choices else ""
+    body = extract_json_block(text)
+    if body is None:
+        print(f"    [bundle] no JSON block in response")
+        return None
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        print(f"    [bundle] JSON parse error: {exc}")
+        return None
+
+
+def generate_one_path_b(
+    *,
+    client: OpenAI,
+    source_bundle_prompt: str,
+    inference_prompt: str,
+    validator: Draft202012Validator,
+    params: GenParams,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    retries: int,
+) -> GenResult:
+    """Path B two-call generation:
+    1. Generate source bundle (no schema validation — just JSON).
+    2. Feed bundle into the inference system prompt and generate the brief
+       with the retry-on-schema-error loop. This IS the production task.
+
+    Separating the calls means schema errors only relate to the brief,
+    the source bundle is fixed across retries, and the model has a clear
+    focused task on each call.
+    """
+    import time as _time
+    t0 = _time.time()
+    result = GenResult(doc=None, attempts=0)
+
+    # ---- Call 1: source bundle ----
+    bundle = generate_source_bundle(
+        client=client,
+        source_bundle_prompt=source_bundle_prompt,
+        params=params,
+        model=model,
+        max_tokens=max_tokens // 2,  # bundle is ~half the total tokens
+        temperature=temperature,
+    )
+    if bundle is None:
+        result.errors_log.append("call 1 (source bundle) failed")
+        result.elapsed_s = _time.time() - t0
+        return result
+
+    # ---- Call 2: brief from bundle (retry loop) ----
+    # Format the bundle as the user message — same as format_jsonl.py does.
+    from train.format_jsonl import format_source_bundle
+    bundle_user_msg = format_source_bundle(bundle)
+
+    messages: list[dict] = [
+        {"role": "system", "content": inference_prompt},
+        {"role": "user", "content": bundle_user_msg},
+    ]
+
+    for attempt in range(retries):
+        result.attempts = attempt + 1
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                max_tokens=max_tokens // 2,
+                temperature=temperature,
+                messages=messages,
+            )
+        except Exception as exc:
+            result.errors_log.append(f"attempt {attempt + 1}: API error: {exc}")
+            break
+
+        text = resp.choices[0].message.content if resp.choices else ""
+        result.last_raw_text = text
+        body = extract_json_block(text)
+
+        if body is None:
+            result.errors_log.append(f"attempt {attempt + 1}: no JSON block")
+            messages += [
+                {"role": "assistant", "content": text},
+                {"role": "user", "content": (
+                    "Your output didn't contain a ```json``` code block. "
+                    "Emit ONLY the brief as a single fenced json block."
+                )},
+            ]
+            continue
+
+        try:
+            brief = json.loads(body)
+        except json.JSONDecodeError as exc:
+            result.errors_log.append(f"attempt {attempt + 1}: JSON parse error: {exc}")
+            messages += [
+                {"role": "assistant", "content": text},
+                {"role": "user", "content": f"JSON parse error: {exc}. Fix the syntax."},
+            ]
+            continue
+
+        errors = list(validator.iter_errors(brief))
+        if not errors:
+            result.doc = {
+                "_meta": {
+                    "account": bundle.get("sf_account", {}).get("name", "unknown"),
+                    "synthetic": True,
+                    "surface": bundle.get("surface"),
+                    "shape_constraints": params.account_shape,
+                    "edge_cases_included": params.edge_cases,
+                },
+                "source_bundle": bundle,
+                "brief": brief,
+            }
+            result.elapsed_s = _time.time() - t0
+            return result
+
+        err_summary = "\n".join(
+            f"- at {'/'.join(str(p) for p in e.absolute_path) or '<root>'}: {e.message}"
+            for e in errors[:10]
+        )
+        result.errors_log.append(
+            f"attempt {attempt + 1}: {len(errors)} schema errors\n"
+            + "\n".join(f"  {l}" for l in err_summary.splitlines())
+        )
+        messages += [
+            {"role": "assistant", "content": text},
+            {"role": "user", "content": (
+                f"The brief had {len(errors)} schema error(s):\n\n{err_summary}\n\n"
+                "Emit the brief again with these fixed. Schema is strict — "
+                "use ONLY defined field names and exact enum values. "
+                "Do not add fields that aren't in the schema."
+            )},
+        ]
+
+    result.elapsed_s = _time.time() - t0
+    return result
+
+
 # ----- ID + dataset-dir management ----------------------------------------
 
 
@@ -483,15 +647,25 @@ def estimate_cost_usd(count: int) -> float:
 def main() -> int:
     args = parse_args()
 
-    prompt_path = SYSTEM_PROMPT_PATH_B if args.mode == "path-b" else SYSTEM_PROMPT_PATH
-    if not prompt_path.exists():
-        print(f"ERROR: system prompt not found at {prompt_path}", file=sys.stderr)
-        return 2
+    if args.mode == "path-b":
+        for p in (SOURCE_BUNDLE_PROMPT_PATH, INFERENCE_PROMPT_PATH):
+            if not p.exists():
+                print(f"ERROR: prompt not found at {p}", file=sys.stderr)
+                return 2
+        source_bundle_prompt = SOURCE_BUNDLE_PROMPT_PATH.read_text()
+        inference_prompt = INFERENCE_PROMPT_PATH.read_text()
+        system_prompt = None  # not used in path-b
+    else:
+        if not SYSTEM_PROMPT_PATH.exists():
+            print(f"ERROR: system prompt not found at {SYSTEM_PROMPT_PATH}", file=sys.stderr)
+            return 2
+        system_prompt = SYSTEM_PROMPT_PATH.read_text()
+        source_bundle_prompt = inference_prompt = None
+
     if not SCHEMA_PATH.exists():
         print(f"ERROR: schema not found at {SCHEMA_PATH}", file=sys.stderr)
         return 2
 
-    system_prompt = prompt_path.read_text()
     schema = json.loads(SCHEMA_PATH.read_text())
     validator = Draft202012Validator(schema)
     print(f"Mode: {args.mode}")
@@ -570,17 +744,30 @@ def main() -> int:
             f"[{i}/{args.count}] id={next_id:03} shape={params.account_shape} "
             f"ec={ec_str}"
         )
-        result = generate_one(
-            client=client,
-            system_prompt=system_prompt,
-            validator=validator,
-            params=params,
-            model=args.model,
-            max_tokens=max_tokens,
-            temperature=args.temperature,
-            retries=retries,
-            mode=args.mode,
-        )
+        if args.mode == "path-b":
+            result = generate_one_path_b(
+                client=client,
+                source_bundle_prompt=source_bundle_prompt,
+                inference_prompt=inference_prompt,
+                validator=validator,
+                params=params,
+                model=args.model,
+                max_tokens=max_tokens,
+                temperature=args.temperature,
+                retries=retries,
+            )
+        else:
+            result = generate_one(
+                client=client,
+                system_prompt=system_prompt,
+                validator=validator,
+                params=params,
+                model=args.model,
+                max_tokens=max_tokens,
+                temperature=args.temperature,
+                retries=retries,
+                mode=args.mode,
+            )
         if result.doc is None:
             print(
                 f"  ✗ failed after {result.attempts} attempt(s) "
