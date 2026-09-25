@@ -461,8 +461,19 @@ def generate_one_path_b(
     from train.format_jsonl import format_source_bundle
     bundle_user_msg = format_source_bundle(bundle)
 
+    # The inference prompt is also the training-time system prompt, so it stays
+    # concise and schema-free. The generator model has never seen the schema,
+    # though — append it here (generation only) so it knows the exact shape.
+    schema_json = json.dumps(validator.schema, indent=2)
+    generation_prompt = (
+        f"{inference_prompt}\n\n"
+        "## Brief schema (authoritative)\n\n"
+        "The brief MUST validate against this JSON Schema. Use exactly these "
+        "field names, nesting, types, and enum values; do not emit `_meta`.\n\n"
+        f"```json\n{schema_json}\n```\n"
+    )
     messages: list[dict] = [
-        {"role": "system", "content": inference_prompt},
+        {"role": "system", "content": generation_prompt},
         {"role": "user", "content": bundle_user_msg},
     ]
 
