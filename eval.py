@@ -178,6 +178,10 @@ def score_one(path: Path, validator: Draft202012Validator) -> dict:
             "schema_errors": [f"json parse: {e}"],
             "coverage": (0, 1), "attribution": (0, 0),
         }
+    # Path B examples wrap the brief as {_meta, source_bundle, brief};
+    # path-a examples are the brief itself.
+    if "brief" in doc:
+        doc = doc["brief"]
     valid, errs = metric_schema_adherence(doc, validator)
     return {
         "id": path.stem,

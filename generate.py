@@ -265,6 +265,16 @@ def _validate_doc(doc: dict, validator: Draft202012Validator, mode: str) -> list
     return list(validator.iter_errors(doc))
 
 
+def _unconsidered_sections(brief: dict, validator: Draft202012Validator) -> list[str]:
+    """Sections the brief neither populated nor declared in empty_sections.
+    The schema can't express this rule, so callers treat it as a warning."""
+    all_sections = set(
+        validator.schema["properties"]["empty_sections"]["items"]["enum"]
+    )
+    considered = set(brief) | set(brief.get("empty_sections") or [])
+    return sorted(all_sections - considered)
+
+
 def generate_one(
     *,
     client: OpenAI,
@@ -465,11 +475,16 @@ def generate_one_path_b(
     # concise and schema-free. The generator model has never seen the schema,
     # though — append it here (generation only) so it knows the exact shape.
     schema_json = json.dumps(validator.schema, indent=2)
+    all_sections = validator.schema["properties"]["empty_sections"]["items"]["enum"]
     generation_prompt = (
         f"{inference_prompt}\n\n"
         "## Brief schema (authoritative)\n\n"
         "The brief MUST validate against this JSON Schema. Use exactly these "
         "field names, nesting, types, and enum values; do not emit `_meta`.\n\n"
+        f"Every one of these {len(all_sections)} sections must be accounted "
+        "for: either populated as a top-level key OR listed in "
+        "`empty_sections` — never silently omitted, even if the section is "
+        f"not emphasized for this surface: {', '.join(all_sections)}.\n\n"
         f"```json\n{schema_json}\n```\n"
     )
     messages: list[dict] = [
@@ -516,6 +531,24 @@ def generate_one_path_b(
             continue
 
         errors = list(validator.iter_errors(brief))
+        missing = [] if errors else _unconsidered_sections(brief, validator)
+        # Coverage gaps retry within the same budget; on the last attempt a
+        # schema-valid brief is kept and main() prints the coverage warning.
+        if missing and attempt + 1 < retries:
+            result.errors_log.append(
+                f"attempt {attempt + 1}: coverage gap: {', '.join(missing)}"
+            )
+            messages += [
+                {"role": "assistant", "content": text},
+                {"role": "user", "content": (
+                    "The brief is schema-valid, but these sections are neither "
+                    f"populated nor listed in empty_sections: {', '.join(missing)}. "
+                    "Emit the brief again with each one either populated (if "
+                    "the source bundle supports it) or added to empty_sections. "
+                    "Keep everything else unchanged."
+                )},
+            ]
+            continue
         if not errors:
             result.doc = {
                 "_meta": {
@@ -813,6 +846,13 @@ def main() -> int:
             if args.verbose and result.errors_log:
                 for log in result.errors_log:
                     print(f"    {log}")
+            brief = result.doc["brief"] if args.mode == "path-b" else result.doc
+            missing = _unconsidered_sections(brief, validator)
+            if missing:
+                print(
+                    "    WARNING: sections neither populated nor in "
+                    f"empty_sections: {', '.join(missing)}"
+                )
             successes += 1
             next_id += 1
 
