@@ -589,7 +589,7 @@ def generate_one_path_b(
 # ----- ID + dataset-dir management ----------------------------------------
 
 
-_ID_RE = re.compile(r"^example-(\d{3})\.json$")
+_ID_RE = re.compile(r"^example-(\d{3,})\.json$")
 
 
 def next_example_id(dataset_dir: Path, override: int | None) -> int:
