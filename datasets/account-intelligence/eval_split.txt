@@ -1,5 +1,5 @@
 # Held-out eval split for ELM account-intelligence model
-# 50 examples, stratified by surface and shape
+# 110 examples: 50 path-a + 60 path-b, each stratified by surface and shape
 # Random seed: 42 (reproducible)
 # DO NOT include these in training data
 
@@ -53,3 +53,66 @@ example-530
 example-533
 example-557
 example-566
+
+# Path B (source_bundle -> brief): 10 per surface, round-robin across shapes
+# Random seed: 42 (reproducible)
+example-1036
+example-1038
+example-1049
+example-1050
+example-1069
+example-1090
+example-1095
+example-1101
+example-1111
+example-1116
+example-584
+example-768
+example-796
+example-799
+example-804
+example-807
+example-815
+example-818
+example-828
+example-843
+example-593
+example-597
+example-599
+example-602
+example-604
+example-612
+example-616
+example-634
+example-642
+example-650
+example-951
+example-964
+example-985
+example-987
+example-993
+example-1000
+example-1012
+example-1021
+example-1030
+example-1032
+example-577
+example-683
+example-694
+example-704
+example-708
+example-711
+example-715
+example-717
+example-746
+example-764
+example-855
+example-867
+example-869
+example-871
+example-874
+example-885
+example-902
+example-922
+example-937
+example-944

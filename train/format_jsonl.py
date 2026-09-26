@@ -16,7 +16,7 @@ IMPORTANT — what this trains:
     Kept for backward compatibility with the ~572 round 1-4 examples.
 
 Splits:
-    - Holds out the 50 IDs in datasets/account-intelligence/eval_split.txt
+    - Holds out the IDs listed in datasets/account-intelligence/eval_split.txt
       to a separate eval.jsonl (used for in-training validation).
     - Everything else goes to train.jsonl.
 
@@ -38,6 +38,7 @@ preparing the dataset, so this is safe.
 Usage:
     python train/format_jsonl.py                      # default paths
     python train/format_jsonl.py --out train/data/    # custom output dir
+    python train/format_jsonl.py --path-b-only        # skip legacy path-a
 """
 from __future__ import annotations
 
@@ -245,6 +246,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", type=Path, default=HERE / "data",
                     help="Output directory for train.jsonl and eval.jsonl")
+    ap.add_argument("--path-b-only", action="store_true",
+                    help="Skip legacy path-a examples (knobs -> brief); "
+                         "emit only path-b (source_bundle -> brief)")
     args = ap.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -263,6 +267,7 @@ def main() -> int:
     eval_count = 0
     path_a_count = 0
     path_b_count = 0
+    skipped_path_a = 0
     by_surface_train: dict[str, int] = defaultdict(int)
     coverage_warnings: list[str] = []
 
@@ -275,6 +280,9 @@ def main() -> int:
                 rec = build_record_path_b(f.stem, doc, inference_system_prompt)
                 surface = (doc.get("brief") or {}).get("surface") or doc.get("_meta", {}).get("surface")
                 path_b_count += 1
+            elif args.path_b_only:
+                skipped_path_a += 1
+                continue
             else:
                 rec = build_record(f.stem, doc, system_prompt_path_a)
                 surface = doc.get("surface") or doc.get("_meta", {}).get("surface")
@@ -295,6 +303,8 @@ def main() -> int:
     print(f"\nWrote {train_path} ({train_count} examples)")
     print(f"Wrote {eval_path} ({eval_count} examples)")
     print(f"\nMode breakdown: {path_b_count} path-b (source_bundle→brief), {path_a_count} path-a (legacy knobs→brief)")
+    if skipped_path_a:
+        print(f"  --path-b-only: skipped {skipped_path_a} path-a examples")
     if path_a_count > 0:
         print(f"  NOTE: {path_a_count} path-a examples included. These train the model on generation knobs,")
         print(f"  not real source data. Consider excluding them once path-b data is sufficient.")
