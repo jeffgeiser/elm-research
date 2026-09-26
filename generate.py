@@ -497,7 +497,7 @@ def generate_one_path_b(
         try:
             resp = client.chat.completions.create(
                 model=model,
-                max_tokens=max_tokens // 2,
+                max_tokens=max_tokens,  # the brief is the long output; don't halve
                 temperature=temperature,
                 messages=messages,
             )
@@ -507,6 +507,25 @@ def generate_one_path_b(
 
         text = resp.choices[0].message.content if resp.choices else ""
         result.last_raw_text = text
+
+        # A cut-off brief has no closing fence, which otherwise looks like
+        # "no JSON block". Say what actually happened, and don't replay the
+        # truncated text into the conversation.
+        if resp.choices and resp.choices[0].finish_reason == "length":
+            result.errors_log.append(
+                f"attempt {attempt + 1}: truncated at max_tokens={max_tokens}"
+            )
+            messages += [
+                {"role": "assistant", "content": "[output cut off at the token limit]"},
+                {"role": "user", "content": (
+                    "Your brief was cut off at the output token limit before it "
+                    "finished. Emit the complete brief again, more concisely: "
+                    "tighten wording, keep recent_activity to the most relevant "
+                    "entries, and omit optional `snippet` fields in sources."
+                )},
+            ]
+            continue
+
         body = extract_json_block(text)
 
         if body is None:
