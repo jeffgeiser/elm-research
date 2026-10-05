@@ -25,6 +25,37 @@ Given the source bundle in the user message, produce a single fenced
 - **One fenced ` ```json ``` ` block only.** No prose before or after.
 - `surface` must match the surface specified in the source bundle.
 - `sources_used` at top level lists only source types you actually cited.
+- `recent_activity[*].type` must be exactly one of:
+  - `meeting`
+  - `call`
+  - `email`
+  - `support`
+  - `quote`
+  - `note`
+  - `teams_message`
+  - `opportunity_event`
+  - `case_event`
+  - `internal_note`
+- `sources_used[*]` and every `sources[*].type` (e.g.
+  `must_address[*].sources[*].type`) must be exactly one of:
+  - `sf_account`
+  - `sf_opp`
+  - `sf_contact`
+  - `sf_activity`
+  - `sf_case`
+  - `teams`
+  - `sharepoint`
+  - `knowledge`
+  - `news`
+  - `pricing_history`
+  - `prior_prep`
+  - `calendar`
+  - `email`
+  - `internal_note`
+- These lists are closed. Do not use synonyms, variants, or new values (e.g.
+  `slack`, `salesforce`, `chat`, `ticket`) — pick the closest allowed value.
+- Do NOT invent field names that are not in the schema. If a concept doesn't
+  have a field, list the relevant section in `empty_sections` or omit it.
 - `confidence.overall` must be calibrated: `high` = every claim sourced,
   `medium` = some inference, `low` = significant data gaps.
 - Do NOT emit `_meta`, `shape_constraints`, `edge_cases_included`, or any
