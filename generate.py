@@ -771,18 +771,21 @@ def main() -> int:
         print("\n--dry-run set; not calling API.")
         return 0
 
-    api_key = (
-        os.environ.get("GATEWAY_API_KEY")
-        or os.environ.get("ANTHROPIC_API_KEY")
-    )
-    if not api_key:
-        print(
-            "ERROR: set GATEWAY_API_KEY (or ANTHROPIC_API_KEY) in environment or .env.",
-            file=sys.stderr,
-        )
-        return 2
-
     base_url = args.base_url or os.environ.get("GATEWAY_BASE_URL") or DEFAULT_BASE_URL
+    # Anthropic's endpoint only accepts Anthropic keys — never send it the
+    # gateway key just because GATEWAY_API_KEY is also set.
+    if "api.anthropic.com" in base_url:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        key_hint = "ANTHROPIC_API_KEY (required for api.anthropic.com)"
+    else:
+        api_key = (
+            os.environ.get("GATEWAY_API_KEY")
+            or os.environ.get("ANTHROPIC_API_KEY")
+        )
+        key_hint = "GATEWAY_API_KEY (or ANTHROPIC_API_KEY)"
+    if not api_key:
+        print(f"ERROR: set {key_hint} in environment or .env.", file=sys.stderr)
+        return 2
     # Apply mode-appropriate defaults if the user didn't override them explicitly.
     max_tokens = args.max_tokens
     retries = args.retries
