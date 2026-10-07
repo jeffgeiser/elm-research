@@ -15,6 +15,10 @@ Flow:
     # 2. Score them
     python eval.py --model train/runs/round4/eval_outputs
 
+Generation is schema-constrained with Outlines (see constrained.py): the
+model can only emit tokens that keep the output a valid brief. Pass
+--unconstrained to reproduce the old free-running generate() baseline.
+
 Outputs, per eval record, into --out:
     <id>.raw.txt   # raw decoded generation (always written)
     <id>.json      # pretty-printed, only if the raw text parses as JSON
@@ -32,6 +36,9 @@ from pathlib import Path
 from unsloth import FastLanguageModel  # noqa: E402
 
 import torch  # noqa: E402
+from jsonschema import Draft202012Validator  # noqa: E402
+
+from constrained import SCHEMA_PATH, build_generator, finalize  # noqa: E402
 
 
 HERE = Path(__file__).parent.resolve()
@@ -93,6 +100,9 @@ def main() -> int:
                          "quick schema-adherence read before committing to "
                          "the full set. eval.py will warn about the rest as "
                          "missing; that's expected on a limited run.")
+    ap.add_argument("--unconstrained", action="store_true",
+                    help="Skip Outlines and use plain model.generate() — the "
+                         "pre-constrained-decoding baseline.")
     args = ap.parse_args()
 
     if not args.adapter.exists():
@@ -122,8 +132,15 @@ def main() -> int:
     )
     FastLanguageModel.for_inference(model)
 
+    validator = Draft202012Validator(json.loads(SCHEMA_PATH.read_text()))
+    generator = None
+    if not args.unconstrained:
+        print("Building Outlines schema index (~30s)...")
+        generator = build_generator(model, tokenizer)
+
     n_done = 0
     n_parse_ok = 0
+    n_valid = 0
     with open(args.eval_jsonl) as f:
         for line in f:
             if args.limit is not None and n_done >= args.limit:
@@ -143,23 +160,35 @@ def main() -> int:
             input_text = tokenizer.apply_chat_template(
                 prompt_msgs, tokenize=False, add_generation_prompt=True
             )
-            inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
-            with torch.no_grad():
-                output = model.generate(
-                    **inputs,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=False,
-                    repetition_penalty=args.repetition_penalty,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-            gen = tokenizer.decode(
-                output[0][inputs.input_ids.shape[1]:],
-                skip_special_tokens=True,
+            gen_kwargs = dict(
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,
+                repetition_penalty=args.repetition_penalty,
+                pad_token_id=tokenizer.eos_token_id,
             )
+            with torch.no_grad():
+                if generator is not None:
+                    # Outlines tokenizes, generates under the schema mask, and
+                    # returns only the newly generated text.
+                    gen = generator(input_text, **gen_kwargs)
+                else:
+                    inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+                    output = model.generate(**inputs, **gen_kwargs)
+                    gen = tokenizer.decode(
+                        output[0][inputs.input_ids.shape[1]:],
+                        skip_special_tokens=True,
+                    )
 
             (out_dir / f"{example_id}.raw.txt").write_text(gen)
+            # Constrained output can still fail to parse if it hit
+            # --max-new-tokens mid-object (truncated prefix).
             parsed = extract_first_json(gen)
+            valid = False
             if parsed is not None:
+                if generator is not None:
+                    parsed = finalize(parsed)
+                valid = validator.is_valid(parsed)
+                n_valid += valid
                 (out_dir / f"{example_id}.json").write_text(
                     json.dumps(parsed, indent=2)
                 )
@@ -169,10 +198,12 @@ def main() -> int:
             ok = parsed is not None
             # Inline diagnostic: size + tail makes the failure mode (truncation,
             # repetition loop, trailing junk) visible right in the run log.
+            status = "✓ valid " if valid else ("~ parsed" if ok else "✗ FAILED")
             print(f"  [{n_done}] {example_id}: {len(gen):>6}B "
-                  f"{'✓ parsed' if ok else '✗ FAILED'} | tail: {gen[-90:]!r}")
+                  f"{status} | tail: {gen[-90:]!r}")
 
-    print(f"\nDone: {n_done} predictions, {n_parse_ok} parsed as JSON → {out_dir}")
+    print(f"\nDone: {n_done} predictions, {n_parse_ok} parsed as JSON, "
+          f"{n_valid} schema-valid → {out_dir}")
     print(f"Now score with:  uv run python eval.py --model {out_dir}")
     return 0
 
