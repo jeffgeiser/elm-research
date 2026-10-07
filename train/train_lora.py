@@ -54,7 +54,7 @@ BASE_MODEL = "unsloth/Qwen2.5-7B-Instruct-bnb-4bit"
 # Restored to 16384 for sole-tenant runs (vLLM stopped). Covers p95~12k
 # and max~13.4k token records without truncation. Drop to 8192 if you
 # need to coexist with vLLM or other GPU workloads.
-MAX_SEQ_LENGTH = 8192
+MAX_SEQ_LENGTH = 16384
 
 LORA_RANK = 16
 LORA_ALPHA = 32
@@ -67,14 +67,14 @@ TARGET_MODULES = [
 LEARNING_RATE = 1e-4     # was 2e-4; dropped after round 1 over-memorized prompts
 PER_DEVICE_BATCH = 1     # conservative at seq_len=16k; can bump to 2 if VRAM allows
 GRAD_ACCUM_STEPS = 16    # keep effective batch = 16
-NUM_EPOCHS = 1
+NUM_EPOCHS = 2
 WARMUP_STEPS = 5         # ~15% of total ~33 steps
 WEIGHT_DECAY = 0.01
 LR_SCHEDULER = "cosine"
 
-# Save + eval cadence — sized for ~33-step runs
+# Save cadence. No in-loop eval (eval_strategy="no") — eval.py runs manually
+# after training.
 SAVE_STEPS = 10
-EVAL_STEPS = 10
 LOGGING_STEPS = 1
 VRAM_LOG_INTERVAL = 5    # log peak VRAM every N steps
 
@@ -301,7 +301,7 @@ class SanityCheckCallback(TrainerCallback):
                 with torch.no_grad():
                     output = self.model.generate(
                         **inputs,
-                        max_new_tokens=8192,
+                        max_new_tokens=512,
                         do_sample=False,
                         temperature=0.0,
                         pad_token_id=self.tokenizer.eos_token_id,
@@ -431,8 +431,7 @@ def main() -> int:
         logging_steps=LOGGING_STEPS,
         save_steps=SAVE_STEPS,
         save_total_limit=4,
-        eval_strategy="steps",
-        eval_steps=EVAL_STEPS,
+        eval_strategy="no",
         report_to="none",
         seed=42,
         optim="adamw_8bit",
