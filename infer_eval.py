@@ -15,6 +15,10 @@ Flow:
     # 2. Score them
     python eval.py --model train/runs/round4/eval_outputs
 
+Base-model baseline (no adapter, no Unsloth — plain transformers on
+CUDA or Apple MPS):
+    python infer_eval.py --no-adapter --out train/runs/baseline/eval_outputs
+
 Generation is schema-constrained with Outlines (see constrained.py): the
 model can only emit tokens that keep the output a valid brief. Pass
 --unconstrained to reproduce the old free-running generate() baseline.
@@ -32,17 +36,14 @@ import json
 import sys
 from pathlib import Path
 
-# Unsloth must be imported before transformers/peft to apply its patches.
-from unsloth import FastLanguageModel  # noqa: E402
+from jsonschema import Draft202012Validator
 
-import torch  # noqa: E402
-from jsonschema import Draft202012Validator  # noqa: E402
-
-from constrained import SCHEMA_PATH, build_generator, finalize  # noqa: E402
+from constrained import SCHEMA_PATH, build_generator, finalize
 
 
 HERE = Path(__file__).parent.resolve()
 DEFAULT_EVAL_JSONL = HERE / "train" / "data" / "eval.jsonl"
+DEFAULT_BASE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 
 _DECODER = json.JSONDecoder()
 
@@ -75,10 +76,18 @@ def extract_first_json(text: str) -> dict | None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--adapter", type=Path, required=True,
-                    help="Path to the trained LoRA adapter dir (e.g. "
-                         "train/runs/round4/final). Unsloth loads the base "
-                         "model named in its adapter_config automatically.")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--adapter", type=Path,
+                     help="Path to the trained LoRA adapter dir (e.g. "
+                          "train/runs/round4/final). Unsloth loads the base "
+                          "model named in its adapter_config automatically.")
+    src.add_argument("--no-adapter", action="store_true",
+                     help="Run the untuned base model (--base-model) in fp16 "
+                          "with plain transformers, no Unsloth — the "
+                          "before-fine-tuning baseline. Requires --out.")
+    ap.add_argument("--base-model", default=DEFAULT_BASE_MODEL,
+                    help="HF model used with --no-adapter "
+                         f"(default: {DEFAULT_BASE_MODEL})")
     ap.add_argument("--eval-jsonl", type=Path, default=DEFAULT_EVAL_JSONL,
                     help="Eval records with messages[] + id (default: "
                          "train/data/eval.jsonl)")
@@ -105,7 +114,10 @@ def main() -> int:
                          "pre-constrained-decoding baseline.")
     args = ap.parse_args()
 
-    if not args.adapter.exists():
+    if args.no_adapter and args.out is None:
+        print("ERROR: --no-adapter requires --out", file=sys.stderr)
+        return 1
+    if args.adapter is not None and not args.adapter.exists():
         print(f"ERROR: adapter dir {args.adapter} not found", file=sys.stderr)
         return 1
     if not args.eval_jsonl.exists():
@@ -119,18 +131,36 @@ def main() -> int:
     stale = list(out_dir.glob("*.json")) + list(out_dir.glob("*.raw.txt"))
     for p in stale:
         p.unlink()
-    print(f"Adapter: {args.adapter}")
+    print(f"Adapter: {args.adapter or f'(none — base model {args.base_model})'}")
     print(f"Eval:    {args.eval_jsonl}")
     print(f"Out:     {out_dir}  (cleared {len(stale)} stale files)")
 
-    # Unsloth detects the PEFT adapter_config and loads base + adapter.
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=str(args.adapter),
-        max_seq_length=args.max_seq_length,
-        dtype=None,
-        load_in_4bit=True,
-    )
-    FastLanguageModel.for_inference(model)
+    if args.no_adapter:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        device = "cuda" if torch.cuda.is_available() else "mps"
+        print(f"Device:  {device}")
+        tokenizer = AutoTokenizer.from_pretrained(args.base_model)
+        # Load (and cast to fp16) on CPU, then move. device_map="mps" segfaults
+        # in torch's MPS cast kernel when transformers loads shards in threads.
+        model = AutoModelForCausalLM.from_pretrained(
+            args.base_model, dtype=torch.float16,
+        ).to(device)
+        model.eval()
+    else:
+        # Unsloth must be imported before transformers/peft to apply its patches.
+        from unsloth import FastLanguageModel
+        import torch
+
+        # Unsloth detects the PEFT adapter_config and loads base + adapter.
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=str(args.adapter),
+            max_seq_length=args.max_seq_length,
+            dtype=None,
+            load_in_4bit=True,
+        )
+        FastLanguageModel.for_inference(model)
 
     validator = Draft202012Validator(json.loads(SCHEMA_PATH.read_text()))
     generator = None
@@ -200,7 +230,7 @@ def main() -> int:
             # repetition loop, trailing junk) visible right in the run log.
             status = "✓ valid " if valid else ("~ parsed" if ok else "✗ FAILED")
             print(f"  [{n_done}] {example_id}: {len(gen):>6}B "
-                  f"{status} | tail: {gen[-90:]!r}")
+                  f"{status} | tail: {gen[-90:]!r}", flush=True)
 
     print(f"\nDone: {n_done} predictions, {n_parse_ok} parsed as JSON, "
           f"{n_valid} schema-valid → {out_dir}")

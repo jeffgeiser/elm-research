@@ -10,13 +10,14 @@ dependencies = [
     # Schema-constrained decoding (constrained.py). 1.x API: outlines.Generator
     "outlines>=1.3.3",
     "python-dotenv>=1.0.1",
+    # Inference (infer_eval.py --no-adapter runs on Mac/MPS as well as CUDA)
+    "accelerate>=1.13.0",
+    "torch>=2.6",
+    "transformers>=5.5.0",
     # Training stack (Linux/CUDA only — Spark or bare-metal)
-    "accelerate>=1.13.0; sys_platform == 'linux'",
     "bitsandbytes>=0.49.2; sys_platform == 'linux'",
     "datasets>=4.1.1,<4.4.0; sys_platform == 'linux'",
     "peft>=0.19.1; sys_platform == 'linux'",
-    "torch>=2.6; sys_platform == 'linux'",
-    "transformers>=5.5.0; sys_platform == 'linux'",
     "trl>=0.24.0; sys_platform == 'linux'",
     "unsloth>=2026.5.7; sys_platform == 'linux'",
 ]
