@@ -13,6 +13,10 @@ dependencies = [
     # Inference (infer_eval.py --no-adapter runs on Mac/MPS as well as CUDA)
     "accelerate>=1.13.0",
     "torch>=2.6",
+    # Pulled in by unsloth. Must come from the same CUDA index as torch on
+    # Linux — the PyPI build fails with "operator torchvision::nms does not
+    # exist" and breaks the unsloth/peft imports.
+    "torchvision>=0.21; sys_platform == 'linux'",
     "transformers>=5.5.0",
     # Training stack (Linux/CUDA only — Spark or bare-metal)
     "bitsandbytes>=0.49.2; sys_platform == 'linux'",
@@ -33,3 +37,4 @@ dev = []
   [tool.uv.sources]
   # cu128 wheel only applies on Linux (Spark / bare-metal training box)
   torch = { index = "pytorch-cu128", marker = "sys_platform == 'linux'" }
+  torchvision = { index = "pytorch-cu128", marker = "sys_platform == 'linux'" }
