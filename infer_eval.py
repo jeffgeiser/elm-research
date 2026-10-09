@@ -19,7 +19,7 @@ Base-model baseline (no adapter, no Unsloth — plain transformers on
 CUDA or Apple MPS):
     python infer_eval.py --no-adapter --out train/runs/baseline/eval_outputs
 
-Quantized GGUF export (llama.cpp's llama-completion must be on PATH; runs
+Quantized GGUF export (llama.cpp's llama-server must be on PATH; runs
 on Apple Silicon):
     python infer_eval.py --gguf models/account-intelligence-7b-round10.Q4_K_M.gguf \
         --out train/runs/gguf_eval
@@ -39,12 +39,14 @@ Outputs, per eval record, into --out:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import shutil
+import socket
 import subprocess
 import sys
-import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 from jsonschema import Draft202012Validator
@@ -146,43 +148,66 @@ def load_torch_generate(args):
 
 
 def load_gguf_generate(args):
-    """Return generate(prompt_msgs) -> str backed by llama.cpp's
-    llama-completion, one process per example."""
-    if shutil.which("llama-completion") is None:
-        sys.exit("ERROR: llama-completion not found on PATH (brew install llama.cpp)")
+    """Start a local llama.cpp server for the GGUF and return
+    generate(prompt_msgs) -> str.
 
-    workdir = Path(tempfile.mkdtemp(prefix="infer_eval_gguf_"))
-    schema_file = workdir / "schema.json"
-    schema_file.write_text(json.dumps(load_constraint_schema()))
-    prompt_file = workdir / "prompt.txt"
+    llama-server rather than llama-completion: the latter returns an empty
+    completion for some prompt lengths (seen at 4,100 tokens), and the server
+    loads the model once instead of once per example.
+    """
+    if shutil.which("llama-server") is None:
+        sys.exit("ERROR: llama-server not found on PATH (brew install llama.cpp)")
 
-    cmd = [
-        "llama-completion", "-m", str(args.gguf), "-f", str(prompt_file),
-        "-n", str(args.max_new_tokens),
-        "-c", str(args.max_seq_length + args.max_new_tokens),
-        "-ngl", "99", "-no-cnv", "--no-display-prompt",
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    url = f"http://127.0.0.1:{port}"
+    server = subprocess.Popen(
+        ["llama-server", "-m", str(args.gguf), "--host", "127.0.0.1",
+         "--port", str(port), "-np", "1", "-ngl", "99",
+         "-c", str(args.max_seq_length + args.max_new_tokens)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    atexit.register(server.terminate)
+
+    print("Starting llama-server...")
+    while True:
+        if server.poll() is not None:
+            sys.exit(f"ERROR: llama-server exited with code {server.returncode}")
+        try:
+            with urllib.request.urlopen(f"{url}/health", timeout=2):
+                break
+        except OSError:  # not listening yet, or 503 while the model loads
+            time.sleep(1)
+
+    body = {
+        "n_predict": args.max_new_tokens,
+        "cache_prompt": False,
         # Greedy, with the penalty window widened from llama.cpp's 64 tokens
         # to the whole context to match transformers' repetition_penalty.
-        "--temp", "0", "--repeat-penalty", str(args.repetition_penalty),
-        "--repeat-last-n", "-1",
-    ]
+        "temperature": 0,
+        "repeat_penalty": args.repetition_penalty,
+        "repeat_last_n": -1,
+    }
     if not args.unconstrained:
-        cmd += ["--json-schema-file", str(schema_file)]
+        # llama.cpp compiles the schema to a grammar server-side.
+        body["json_schema"] = load_constraint_schema()
 
     def generate(prompt_msgs: list[dict]) -> str:
         # Qwen ChatML, written out by hand so this path needs no tokenizer.
         # Matches tokenizer.apply_chat_template for system+user turns.
-        prompt_file.write_text(
+        prompt = (
             "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
                     for m in prompt_msgs)
             + "<|im_start|>assistant\n"
         )
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            print(f"WARN: llama-completion exited {proc.returncode}: "
-                  f"{proc.stderr[-300:]!r}", file=sys.stderr)
-        # llama-completion appends this marker to stdout when the model stops.
-        return proc.stdout.replace(" [end of text]", "").rstrip("\n")
+        req = urllib.request.Request(
+            f"{url}/completion",
+            json.dumps({**body, "prompt": prompt}).encode(),
+            {"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req) as resp:
+            return json.load(resp)["content"]
 
     return generate
 
@@ -200,9 +225,9 @@ def main() -> int:
                           "with plain transformers, no Unsloth — the "
                           "before-fine-tuning baseline. Requires --out.")
     src.add_argument("--gguf", type=Path,
-                     help="Run a GGUF file through llama.cpp's llama-completion "
-                          "(Metal on Apple Silicon), constrained by llama.cpp's "
-                          "JSON-schema grammar. Requires --out.")
+                     help="Run a GGUF file through a local llama.cpp "
+                          "llama-server (Metal on Apple Silicon), constrained "
+                          "by llama.cpp's JSON-schema grammar. Requires --out.")
     ap.add_argument("--base-model", default=DEFAULT_BASE_MODEL,
                     help="HF model used with --no-adapter "
                          f"(default: {DEFAULT_BASE_MODEL})")
